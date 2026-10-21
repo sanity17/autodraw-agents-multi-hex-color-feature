@@ -1,0 +1,112 @@
+You are working on AutoDraw, a C# Avalonia desktop app (.NET 8, net8.0-windows, Avalonia 11.2.4) that traces imported images by automating the mouse cursor and keyboard. The codebase is in your working directory. Read AGENTS.md first.
+
+Build command (must stay green after every step):
+  dotnet build Autodraw.sln --no-restore
+
+There is no test project. Validation is manual on Windows.
+
+Key files and ownership:
+- Draw.cs              — Drawing.Draw(), DrawStack(), InputAction, DFS/Edge/A* path generation
+- ImageProcessing.cs   — Filters, Process(), ProcessLayerMask(), ExtractPalette(), SplitImageByColors()
+- Input.cs             — SharpHook + SimWinMouse wrapper. MoveTo, SendClick, SendKeyDown, ReplaceFocusedText
+- ColorPicker.cs       — Wheel calibration (F5) + SelectWheelColor(hex)
+- MainWindow.axaml.cs  — UI wiring, layer generation, _actionStack, RunButtonOnClick
+- Preview.axaml.cs     — Overlay window that calls Drawing.Draw/DrawStack on start keybind
+- Utils.cs             — Config (JSON at %LOCALAPPDATA%\AutoDraw\config.json), Marketplace, logging
+- ActionPrompt.axaml.cs — User-defined InputAction editor
+
+Hard constraints (never violate):
+1. Do NOT rewrite Input.cs. Wrap it. All input goes through Input.* (never call SimMouse/EventSimulator directly from drawing code).
+2. Do NOT delete Drawing.Draw() or Drawing.DrawStack(). Wrap them.
+3. Do NOT change the signature of ColorPicker.SaveWheelCalibration or ColorPicker.UsesWheel.
+4. Do NOT rename ColorLayerResult fields (Bitmap, Color, PixelCount).
+5. Do NOT break public Config API: GetEntry, SetEntry, Keybind_*, Preview_LastLockPos. Existing keys must stay backwards-compatible.
+6. All new UI must marshal to Dispatcher.UIThread.
+7. Dispose every SKBitmap you create. Use GC.AddMemoryPressure/RemoveMemoryPressure for large buffers.
+8. Use Utils.Log(...) for diagnostics, gated by Config.GetEntry("logsEnabled").
+9. Do NOT add NuGet packages unless strictly necessary. Justify in a comment if you do.
+10. Do NOT add a DI container, mediator, or reflection-based plugin system.
+11. Do NOT add unit test scaffolding. No test project exists.
+12. Do NOT add comments that explain what the code obviously does. Comment only the non-obvious "why".
+13. No placeholder // TODO: implement. Every file must compile and run.
+14. Do NOT change build.sh.
+15. Preserve Avalonia XAML ↔ code-behind wiring (DataContext pattern, InitializeComponent).
+
+You are porting every feature from a more advanced drawing automation tool called LX Painter. Its config schema is the source of truth for what to build. Every setting listed below must become a working feature with a corresponding UI control.
+
+LX Painter config schema (full):
+  algorithm           : "DFS (Default)" | "Concentric"
+  bg_colors_to_remove : array of RGB triples
+  bi_d                : bilateral filter diameter (int, default 9)
+  bi_sc               : bilateral sigma color (float, default 75.0)
+  bi_ss               : bilateral sigma space (float, default 75.0)
+  box_br / box_tl     : Sat/Val box bottom-right / top-left coords
+  box_hue_start/end   : hue slider start/end coords
+  captured_palette    : array of {coord:[x,y], rgb:[r,g,b]}
+  click_delay         : float seconds
+  close_picker_coord  : [x,y]
+  colors_per_layer    : int
+  custom_w / custom_h : int (0 = auto)
+  delay_close/input/open : float seconds
+  draw_method         : "1:1 Exact (AutoDraw)" | "Pixel Size Scaling"
+  draw_region         : [x1,y1,x2,y2]
+  enable_auto_layer   : bool
+  enable_macros       : bool
+  gif_effect_opacity  : int
+  gif_effect_path     : string
+  hex_coord           : [x,y]
+  hsv_coords          : array of coords
+  interval            : int (x100ns)
+  k_clusters          : int
+  kmeans_algo         : "KMeans++ (Original)" | "MiniBatchKMeans (Fast)"
+  lab_chroma_weight   : float
+  lab_contrast_thresh : float
+  lab_edge_preservation : float
+  lab_hue_weight      : float
+  lab_lum_weight      : float
+  lab_range_sigma     : float
+  lab_spatial_iter    : int
+  lab_spatial_sigma   : float
+  language            : string
+  layer_order         : "Largest to smallest" | "Brightness to darkness"
+  layer_targets       : array
+  location_mode       : int
+  lock_shape          : bool
+  mode                : "color"
+  monitor_index       : int
+  open_picker_coord   : [x,y]
+  picker_type         : "Hex" | "RGB" | "HSV" | "Wheel" | "Palette Match"
+  pixel_size          : int
+  quantize_method     : "KMeans++" | "Lab Color Space"
+  remove_stray        : bool
+  rgb_coords          : array of coords
+  safe_search         : "moderate" | "off"
+  search_limit        : int
+  seeds_count         : int
+  stencil_enabled     : bool
+  stencil_opacity     : int
+  use_bilateral       : bool
+  use_seeds           : bool
+  wheel_bright/dark   : [x,y]
+  wheel_center/edge   : [x,y]
+  wheel_dir           : "CCW" | "CW"
+
+UI strings that must exist (from LX Painter's English language file):
+  Tabs: General, Advanced Quantize, Color Picker, Auto Layer, Remove BG, Image Finder, Config, Language
+  Actions: Select Monitor, Select Image (Ctrl+V), Select Area (F1), Drag Image
+  Custom W (0=Auto), Custom H (0=Auto)
+  Mode, Method, Algorithm, Layer Order, Colors Amount, Pixel Size
+  Interval (x100ns), Click Delay (s)
+  Process Image, Start / Pause (F2), Reset (F4)
+  Original Image, Processed (Quantized), Progress, Ready
+  Advanced Quantize: Lum Weight, Chroma Weight, Hue Weight, Contrast Thresh, Spatial Sigma, Spatial Iter, Edge Preserv, Range Sigma
+  Advanced Filters: Enable Bilateral Filter, Diameter, Sigma Color, Sigma Space
+  Use SEEDS Superpixels, Desired Superpixels, Remove Stray Pixels
+  Picker Type, Set HEX/RGB/HSV Field (F5), Calibrate Color Circle, Calibrate Brightness Slider, Rotation, Calibrate Hue Slider, Calibrate Sat/Val Box
+  Capture Palette (F5), Clear Palette
+  Macro Settings, Set Open Picker Pos, Set Close Picker Pos
+  Enable Auto Draw Layer, Colors per layer, Add Layers, Clear Layers
+  Colors to Remove, Pick Color from Screen, Clear Colors, Tolerance, Apply Background Removal
+  Limit, Search
+  Saved Configurations, Refresh List, Load Config, Save Config As..., Reset to Default
+  Select Language

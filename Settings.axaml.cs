@@ -42,6 +42,7 @@ public partial class Settings : Window
         
         // Main Handle
         CloseAppButton.Click += CloseAppButton_Click;
+        ColorPickerHelpButton.Click += ShowColorPickerHelp;
         // Sidebar
         SettingsTabs.PropertyChanged += SettingsTabsOnPropertyChanged;
 
@@ -139,6 +140,11 @@ public partial class Settings : Window
         ImageCacheLocationFolderButton.Click += ImageCacheLocationFolderButtonOnClick;
         ImageCacheLocationSaveButton.Click += ImageCacheLocationSaveButtonOnClick;
         ImageCacheLocationClearButton.Click += ImageCacheLocationClearButtonOnClick;
+    }
+
+    private void ShowColorPickerHelp(object? sender, RoutedEventArgs e)
+    {
+        new MessageBox().ShowMessageBox("Color Picker Setup", ColorPicker.GetUsageInstructions());
     }
 
     private void MarketplaceTabsOnPropertyChanged(object? sender, AvaloniaPropertyChangedEventArgs e)

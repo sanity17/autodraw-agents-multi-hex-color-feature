@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -12,9 +12,9 @@ using Avalonia.Threading;
 using SharpHook;
 using SharpHook.Native;
 using SkiaSharp;
+using Autodraw.Configuration;
 
 namespace Autodraw;
-
 
 // This is solely for Inputs from the DrawStack stuff.
 public class InputAction
@@ -49,10 +49,20 @@ public class InputAction
             case ActionType.LeftClick:
             case ActionType.RightClick:
             case ActionType.MoveTo:
-            case ActionType.SetColorHex:
                 if (data is Vector2 pos)
                 {
                     Position = pos;
+                }
+                break;
+
+            case ActionType.SetColorHex:
+                if (data is Vector2 colorPosition)
+                {
+                    Position = colorPosition;
+                }
+                else
+                {
+                    Data = data as string;
                 }
                 break;
 
@@ -105,7 +115,18 @@ public class InputAction
                 break;
 
             case ActionType.SetColorHex:
-                if (ColorPicker.UsesWheel)
+                // SelectColor dispatches on PickerType (RGB / HEX / HSV / Wheel / Box /
+                // Palette Match) and falls back to the calibrated legacy wheel when the
+                // config lacks the coordinates the active type needs.
+                var pickerType = DdConfigService.Current.PickerType;
+                if (!string.IsNullOrWhiteSpace(pickerType))
+                {
+                    await ColorPicker.SelectColor(Data ?? string.Empty);
+                    break;
+                }
+
+                // No configured picker type: legacy calibration, then raw text entry.
+                if (ColorPicker.IsCalibrated)
                 {
                     await ColorPicker.SelectWheelColor(Data ?? string.Empty);
                     break;
@@ -148,14 +169,16 @@ public class InputAction
     }
 }
 
-
 public static class Drawing
 {
-    
+    public static bool Painting_Legacy;
+
     // Variables
 
     public static int Interval = 10000;
     public static int ClickDelay = 1000; // Milliseconds, please multiply by 10000
+    /// <summary>Immutable configuration captured for the current drawing run.</summary>
+    public static AutoDrawConfig? ActiveConfiguration { get; private set; }
     
     /// <summary>
     ///  0 indicates DFS, 1 indicates Edge-Following
@@ -169,11 +192,38 @@ public static class Drawing
     public static bool IsSkipping;
     public static bool FreeDraw2 = false;
 
+    // HexedDrawer-compatible run settings and progress.
+    public static string DfsMode = "8-Directional";
+    public static string DrawerModule = "New (A* Bridge)";
+    public static int BrushSize = 1;
+    public static bool ClipToRegion;
+    public static long ProgressDrawn { get; private set; }
+    public static long ProgressTotal { get; private set; }
+    public static double ProgressPercent => ProgressTotal <= 0 ? 0 : Math.Clamp(ProgressDrawn * 100d / ProgressTotal, 0d, 100d);
+    public static event EventHandler? ProgressChanged;
+
+    private static long _lastProgressTicks;
+    private static bool _progressMuted;
+
+    private static void ReportProgress(long drawn, long total, bool force = false)
+    {
+        ProgressDrawn = Math.Max(0, drawn);
+        ProgressTotal = Math.Max(0, total);
+        var now = Environment.TickCount64;
+        if (!force && now - _lastProgressTicks < 60) return;
+        _lastProgressTicks = now;
+        ProgressChanged?.Invoke(null, EventArgs.Empty);
+    }
+
+    public static void ResetProgress()
+    {
+        ReportProgress(0, 0, true);
+    }
+
     public static Vector2 LastPos = Config.Preview_LastLockPos;
 
     public static bool ShowPopup =
         Config.GetEntry("showPopup") == null || bool.Parse(Config.GetEntry("showPopup") ?? "true");
-
 
     private static DrawDataDisplay? _dataDisplay;
 
@@ -191,32 +241,63 @@ public static class Drawing
                 await Task.Delay(1);
     }
 
+    public static Task DelaySeconds(double seconds) => NOP((long)Math.Max(0, seconds) * 10_000_000L);
+
     private static unsafe byte[,] Scan(SKBitmap bitmap)
     {
         _totalScanSize = 0;
         _completeTotalScan = 0;
-        var _pixelArray = new byte[bitmap.Width, bitmap.Height];
+        var width = bitmap.Width;
+        var height = bitmap.Height;
+        var source = new byte[width, height];
         var bitPtr = (byte*)bitmap.GetPixels().ToPointer();
 
-
-        for (var y = 0; y < bitmap.Height; y++)
-        for (var x = 0; x < bitmap.Width; x++)
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
         {
             var redByte = *bitPtr++;
             bitPtr++;
             bitPtr++;
             bitPtr++;
-
-            _pixelArray[x, y] = redByte < 127 ? (byte)1 : (byte)0;
-            if (redByte < 127) _totalScanSize += 1;
+            source[x, y] = redByte < 127 ? (byte)1 : (byte)0;
         }
 
-        return _pixelArray;
+        if (BrushSize <= 1)
+        {
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+                if (source[x, y] == 1) _totalScanSize++;
+            return source;
+        }
+
+        // A larger brush stamps a square tip.  The expanded mask is what gets traversed, so
+        // the generated path covers the requested stroke width instead of only its centreline.
+        var radius = Math.Clamp(BrushSize / 2, 1, 32);
+        var expanded = new byte[width, height];
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+        {
+            if (source[x, y] != 1) continue;
+            for (var dy = -radius; dy <= radius; dy++)
+            for (var dx = -radius; dx <= radius; dx++)
+            {
+                var nx = x + dx;
+                var ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                expanded[nx, ny] = 1;
+            }
+        }
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+            if (expanded[x, y] == 1) _totalScanSize++;
+        return expanded;
     }
 
     public static void Halt()
     {
         IsDrawing = false;
+        IsPaused = false;
+        StackHalted = true;
     }
 
     private static List<Dictionary<Vector2, int>> GetChunks(SKBitmap srcBitmap)
@@ -342,132 +423,297 @@ public static class Drawing
         return chunks;
     }
 
-    private static List<List<Vector2>> GenerateActions(List<Dictionary<Vector2, int>> chunks, byte[,] data)
+    /// <summary>
+    /// Builds one continuous pen path for every connected painted component.  Every move is to an
+    /// eight-connected neighbour, so the target application never receives a long accidental
+    /// stroke between two unrelated pixels.  Returning to a parent is intentional: it lets DFS
+    /// cover branches without lifting the mouse.
+    /// </summary>
+    private static List<List<Vector2>> GenerateActions(byte[,] data)
     {
-        Vector2[] relativeDirections =
+        var relativeDirections = GetDirections();
+        var actions = new List<List<Vector2>>();
+        for (var y = 0; y < data.GetLength(1); y++)
+        for (var x = 0; x < data.GetLength(0); x++)
         {
-            new(0, -1),    // Up
-            new(1, 0),     // Right
-            new(0, 1),     // Down
-            new(-1, 0),    // Left
-            new(-1, -1),   // Top-Left (Diagonal)
-            new(1, -1),    // Top-Right (Diagonal)
-            new(1, 1),     // Bottom-Right (Diagonal)
-            new(-1, 1)     // Bottom-Left (Diagonal)
-        };
-
-        List<List<Vector2>> actions = new();
-
-        // Traverse each chunk
-        foreach (Dictionary<Vector2, int> chunk in chunks)
-        {
-            foreach (KeyValuePair<Vector2, int> startPoint in chunk)
-            {
-                if (data[(int)startPoint.Key.X, (int)startPoint.Key.Y] != 1) continue;
-
-                // Perform DFS to find connected components
-                actions.Add(ChosenFunction(startPoint.Key, data, relativeDirections,chunk));
-            }
+            if (data[x, y] != 1) continue;
+            actions.Add(ChosenFunction(new Vector2(x, y), data, relativeDirections));
         }
-
         return actions;
     }
 
-    private static List<Vector2> ChosenFunction(Vector2 start, byte[,] data, Vector2[] relativeDirections, Dictionary<Vector2, int> chunk)
+    private static Vector2[] GetDirections()
     {
-        if (ChosenAlgorithm == 0)
-        {
-            return DFS(start, data, relativeDirections);
-        }
-        if (ChosenAlgorithm == 1)
-        {
-            return EdgeTraversal(start, data, relativeDirections);
-        }
+        var four = DfsMode.Contains("4", StringComparison.OrdinalIgnoreCase);
+        return four
+            ? new[]
+            {
+                new Vector2(0, -1), new Vector2(1, 0), new Vector2(0, 1), new Vector2(-1, 0)
+            }
+            : new[]
+            {
+                new Vector2(0, -1), new Vector2(1, 0), new Vector2(0, 1), new Vector2(-1, 0),
+                new Vector2(-1, -1), new Vector2(1, -1), new Vector2(1, 1), new Vector2(-1, 1)
+            };
+    }
 
-        return DFS(start, data, relativeDirections); // This really shouldn't happen.
+    private static List<Vector2> ChosenFunction(Vector2 start, byte[,] data, Vector2[] relativeDirections)
+    {
+        return ChosenAlgorithm switch
+        {
+            1 => EdgeTraversal(start, data, relativeDirections),
+            2 => Concentric(start, data),
+            _ => DFS(start, data, relativeDirections)
+        };
     }
     
     private static List<Vector2> EdgeTraversal(Vector2 start, byte[,] data, Vector2[] directions)
     {
-        List<Vector2> path = new();
-        Vector2 currentPosition = start;
-        int currentDirection = 1;
-
-        while (true)
-        {
-            bool moved = false;
-
-            foreach (int directionIndex in GetDirectionOrder(currentDirection))
-            {
-                Vector2 newPosition = currentPosition + directions[directionIndex];
-                if (IsValidMove(newPosition, data))
-                {
-                    path.Add(newPosition);
-                    currentPosition = newPosition;
-                    currentDirection = directionIndex;
-                    data[(int)newPosition.X, (int)newPosition.Y] = 2; // Mark as traveled
-                    moved = true;
-                    break;
-                }
-            }
-
-            if (!moved)
-                break;
-        }
-        return path;
+        // Prefer the outside of a component, but retain the same complete traversal guarantee
+        // as DFS.  The former edge follower stopped after one contour and silently dropped
+        // interiors, branches, and isolated pixels.
+        return TraverseComponent(start, data, directions, preferEdges: true);
     }
 
     private static List<Vector2> DFS(Vector2 start, byte[,] data, Vector2[] directions)
     {
-        Stack<Vector2> stack = new();
-        List<Vector2> path = new();
+        return TraverseComponent(start, data, directions, preferEdges: false);
+    }
 
-        Vector2? previousPosition = null;
+    /// <summary>
+    /// Concentric traversal: paints one connected component ring by ring, expanding from its
+    /// centroid.  Each ring is swept in one angular direction beginning where the pen arrived,
+    /// and any gap between consecutive points is bridged through other pixels of the same
+    /// component, so every emitted step stays 8-adjacent and the pen never paints a line
+    /// across empty space.  Repainting an already-drawn bridge pixel is intentional: it keeps
+    /// the path contiguous, the same way DFS backtracking re-visits parents.
+    /// </summary>
+    private static List<Vector2> Concentric(Vector2 start, byte[,] data)
+    {
+        var pixels = CollectComponent(start, data); // also marks every collected pixel visited
+        var component = new HashSet<Vector2>(pixels);
+        var path = new List<Vector2> { start };
+        if (pixels.Count <= 1) return path;
 
-        stack.Push(start);
-        data[(int)start.X, (int)start.Y] = 2;
+        var cx = pixels.Average(p => p.X);
+        var cy = pixels.Average(p => p.Y);
 
-        while (stack.Count > 0)
+        // Bucket pixels into rings by integer distance from the centroid, then walk outward.
+        var rings = pixels
+            .Select(p => (Pixel: p, Ring: (int)MathF.Floor(Vector2.Distance(p, new Vector2((float)cx, (float)cy)))))
+            .GroupBy(entry => entry.Ring)
+            .OrderBy(group => group.Key)
+            .Select(group => group.Select(entry => entry.Pixel).ToList());
+
+        var painted = new HashSet<Vector2> { start };
+        var current = start;
+        var arrivalAngle = Math.Atan2(start.Y - cy, start.X - cx);
+
+        foreach (var ring in rings)
         {
-            Vector2 currentPosition = stack.Pop();
+            // Sweep the ring around the circle from the arrival angle so consecutive points
+            // are neighbours instead of alternating across the ring.
+            var entryAngle = arrivalAngle;
+            var ordered = ring
+                .Where(p => !painted.Contains(p))
+                .OrderBy(p => NormalizeAngle(Math.Atan2(p.Y - cy, p.X - cx) - entryAngle))
+                .ToList();
 
-            if (previousPosition.HasValue && !IsAdjacent(previousPosition.Value, currentPosition, directions))
+            foreach (var target in ordered)
             {
-                List<Vector2> aStarPath = AStar(previousPosition.Value, currentPosition, data);
-                path.AddRange(aStarPath);
-
-                foreach (var position in aStarPath)
-                {
-                    data[(int)position.X, (int)position.Y] = 2;
-                }
+                if (painted.Contains(target)) continue; // an earlier bridge already painted it
+                if (!AreAdjacent(current, target))
+                    foreach (var step in BridgePath(current, target, component))
+                    {
+                        path.Add(step); // repaint keeps the pen path contiguous
+                        painted.Add(step);
+                        current = step;
+                    }
+                path.Add(target);
+                painted.Add(target);
+                current = target;
             }
+            if (ordered.Count > 0) arrivalAngle = Math.Atan2(current.Y - cy, current.X - cx);
+        }
 
-            path.Add(currentPosition);
-            previousPosition = currentPosition;
-
-            foreach (Vector2 direction in directions)
-            {
-                Vector2 neighbor = currentPosition + direction;
-                if (IsValidMove(neighbor, data))
+        // Safety net for pixels skipped because a bridge painted them early, plus any left by
+        // floating-point ring bucketing: append them via a component-internal bridge.
+        foreach (var leftover in pixels)
+        {
+            if (painted.Contains(leftover)) continue;
+            if (!AreAdjacent(current, leftover))
+                foreach (var step in BridgePath(current, leftover, component))
                 {
-                    data[(int)neighbor.X, (int)neighbor.Y] = 2;
-                    stack.Push(neighbor);
+                    path.Add(step); // repaint keeps the pen path contiguous
+                    painted.Add(step);
+                    current = step;
                 }
-            }
+            path.Add(leftover);
+            painted.Add(leftover);
+            current = leftover;
         }
 
         return path;
     }
 
+    /// <summary>Returns every pixel of the 8-connected component containing <paramref name="start"/>,
+    /// marking each as visited so the caller's scan does not restart on the same shape.</summary>
+    private static List<Vector2> CollectComponent(Vector2 start, byte[,] data)
+    {
+        var pixels = new List<Vector2> { start };
+        var pending = new Stack<Vector2>();
+        pending.Push(start);
+        data[(int)start.X, (int)start.Y] = 2;
+        while (pending.Count > 0)
+        {
+            var point = pending.Pop();
+            for (var dy = -1; dy <= 1; dy++)
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+                var next = point + new Vector2(dx, dy);
+                if (!IsValidMove(next, data)) continue;
+                data[(int)next.X, (int)next.Y] = 2;
+                pixels.Add(next);
+                pending.Push(next);
+            }
+        }
+        return pixels;
+    }
+
+    /// <summary>Shortest 8-connected route inside the component between two of its pixels,
+    /// excluding both endpoints.  Empty when the points are already adjacent.  The "New"
+    /// drawer module uses A*; "Old" keeps the legacy breadth-first bridge.</summary>
+    private static List<Vector2> BridgePath(Vector2 from, Vector2 to, HashSet<Vector2> component)
+    {
+        if (from == to || AreAdjacent(from, to)) return new();
+        if (DrawerModule.Contains("new", StringComparison.OrdinalIgnoreCase))
+            return AStarBridgePath(from, to, component);
+
+        var previous = new Dictionary<Vector2, Vector2> { [from] = from };
+        var pending = new Queue<Vector2>();
+        pending.Enqueue(from);
+        while (pending.Count > 0 && !previous.ContainsKey(to))
+        {
+            var point = pending.Dequeue();
+            for (var dy = -1; dy <= 1; dy++)
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+                var next = point + new Vector2(dx, dy);
+                if (!component.Contains(next) || previous.ContainsKey(next)) continue;
+                previous[next] = point;
+                pending.Enqueue(next);
+            }
+        }
+        if (!previous.ContainsKey(to)) return new(); // unreachable while the component is intact
+
+        var reversed = new List<Vector2>();
+        for (var step = to; step != from; step = previous[step]) reversed.Add(step);
+        reversed.RemoveAt(0); // the caller appends the target itself
+        reversed.Reverse();
+        return reversed;
+    }
+
+    private static List<Vector2> AStarBridgePath(Vector2 from, Vector2 to, HashSet<Vector2> component)
+    {
+        var open = new PriorityQueue<Vector2, float>();
+        var closed = new HashSet<Vector2>();
+        var cameFrom = new Dictionary<Vector2, Vector2>();
+        var cost = new Dictionary<Vector2, float> { [from] = 0 };
+        open.Enqueue(from, 0);
+        while (open.Count > 0)
+        {
+            var current = open.Dequeue();
+            if (current == to) break;
+            if (!closed.Add(current)) continue;
+            for (var dy = -1; dy <= 1; dy++)
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+                var next = current + new Vector2(dx, dy);
+                if (!component.Contains(next)) continue;
+                var nextCost = cost[current] + (dx != 0 && dy != 0 ? 1.4142135f : 1f);
+                if (cost.TryGetValue(next, out var known) && nextCost >= known) continue;
+                cost[next] = nextCost;
+                cameFrom[next] = current;
+                open.Enqueue(next, nextCost + Math.Abs(next.X - to.X) + Math.Abs(next.Y - to.Y));
+            }
+        }
+        if (!cameFrom.ContainsKey(to)) return new();
+        var result = new List<Vector2>();
+        for (var step = to; step != from; step = cameFrom[step]) result.Add(step);
+        result.RemoveAt(0);
+        result.Reverse();
+        return result;
+    }
+
+    private static bool AreAdjacent(Vector2 a, Vector2 b) =>
+        Math.Abs(a.X - b.X) <= 1 && Math.Abs(a.Y - b.Y) <= 1;
+
+    private static double NormalizeAngle(double angle)
+    {
+        var turns = angle % (2 * Math.PI);
+        return turns < 0 ? turns + 2 * Math.PI : turns;
+    }
+
+    private static List<Vector2> TraverseComponent(Vector2 start, byte[,] data, Vector2[] directions, bool preferEdges)
+    {
+        var path = new List<Vector2> { start };
+        var stack = new Stack<(Vector2 Position, int NextDirection)>();
+        stack.Push((start, 0));
+        data[(int)start.X, (int)start.Y] = 2;
+
+        while (stack.Count > 0)
+        {
+            var frame = stack.Pop();
+            var orderedDirections = preferEdges
+                ? Enumerable.Range(0, directions.Length)
+                    .OrderByDescending(i => IsBoundary(frame.Position + directions[i], data))
+                    .ThenBy(i => i)
+                    .ToArray()
+                : Enumerable.Range(0, directions.Length).ToArray();
+
+            var moved = false;
+            for (var orderIndex = frame.NextDirection; orderIndex < orderedDirections.Length; orderIndex++)
+            {
+                var neighbour = frame.Position + directions[orderedDirections[orderIndex]];
+                if (!IsValidMove(neighbour, data)) continue;
+                stack.Push((frame.Position, orderIndex + 1));
+                data[(int)neighbour.X, (int)neighbour.Y] = 2;
+                path.Add(neighbour);
+                stack.Push((neighbour, 0));
+                moved = true;
+                break;
+            }
+            if (!moved && stack.Count > 0)
+            {
+                // The next frame is this node's parent, therefore the replayed position is
+                // adjacent and painting it again is safe.
+                path.Add(stack.Peek().Position);
+            }
+        }
+        return path;
+    }
+
+    private static bool IsBoundary(Vector2 position, byte[,] data)
+    {
+        if (!IsWithinBounds(position, data) || data[(int)position.X, (int)position.Y] == 0) return true;
+        foreach (var direction in new[] { new Vector2(0, -1), new Vector2(1, 0), new Vector2(0, 1), new Vector2(-1, 0) })
+        {
+            var neighbour = position + direction;
+            if (!IsWithinBounds(neighbour, data) || data[(int)neighbour.X, (int)neighbour.Y] == 0)
+                return true;
+        }
+        return false;
+    }
+
+    /* The A* helpers below remain available for legacy callers; path generation uses a complete
+       contiguous walk now, which is both cheaper and correct for branching components. */
     private static bool IsAdjacent(Vector2 position1, Vector2 position2, Vector2[] directions)
     {
         foreach (Vector2 direction in directions)
-        {
-            if (position1 + direction == position2)
-            {
-                return true;
-            }
-        }
+            if (position1 + direction == position2) return true;
         return false;
     }
 
@@ -517,7 +763,6 @@ public static class Drawing
                 }
             }
         }
-
         return new();
     }
 
@@ -582,10 +827,30 @@ public static class Drawing
                data[(int)position.X, (int)position.Y] == 1;
     }
 
+    private static void ApplyRuntimeConfiguration(AutoDrawConfig config)
+    {
+        Interval = (int)Math.Clamp(config.Interval, 0, int.MaxValue);
+        ClickDelay = (int)Math.Clamp(Math.Round(config.ClickDelay * 1000), 0, int.MaxValue);
+        DfsMode = config.DfsMode;
+        DrawerModule = config.DrawerModule;
+        BrushSize = Math.Clamp(config.BrushSize, 1, 64);
+    }
+
     private static bool StackHalted;
     public static async Task<bool> DrawStack(List<ColorLayerResult> stack, List<InputAction> actions, Vector2 position)
     {
+        ActiveConfiguration = DdConfigService.Current;
+        ApplyRuntimeConfiguration(ActiveConfiguration);
+        var config = ActiveConfiguration;
+        stack = config.LayerOrder.Contains("largest", StringComparison.OrdinalIgnoreCase)
+            ? stack.OrderByDescending(layer => layer.PixelCount).ToList()
+            : config.LayerOrder.Contains("darkness", StringComparison.OrdinalIgnoreCase) ||
+              config.LayerOrder.Contains("dark to bright", StringComparison.OrdinalIgnoreCase)
+                ? stack.OrderBy(layer => layer.Color.Red * .2126 + layer.Color.Green * .7152 + layer.Color.Blue * .0722).ToList()
+                : stack.OrderByDescending(layer => layer.Color.Red * .2126 + layer.Color.Green * .7152 + layer.Color.Blue * .0722).ToList();
         StackHalted = false;
+        _progressMuted = true;
+        ReportProgress(0, stack.Sum(layer => (long)Math.Max(0, layer.PixelCount)), true);
         static void KeybindRelease(object? sender, KeyboardHookEventArgs e)
         {
             if (e.Data.KeyCode == Config.Keybind_StopDrawing) { StackHalted = true; }
@@ -636,9 +901,14 @@ public static class Drawing
             using SKBitmap processedBitmap = ImageProcessing.ProcessLayerMask(layer.Bitmap, ImageProcessing._currentFilters);
             await NOP(1000000);
             await Draw(processedBitmap, position, false);
+            ReportProgress(ProgressDrawn, ProgressTotal, true);
+            if (StackHalted) break;
         }
 
         Input.taskHook.KeyReleased -= KeybindRelease;
+        _progressMuted = false;
+        ActiveConfiguration = null;
+        ReportProgress(StackHalted ? ProgressDrawn : ProgressTotal, ProgressTotal, true);
 
         if (ShowPopup && !StackHalted)
         {
@@ -654,6 +924,9 @@ public static class Drawing
     public static async Task<bool> Draw(SKBitmap bitmap, Vector2 position, bool showFinishedPopup = true)
     {
         if (IsDrawing) return false;
+        ActiveConfiguration ??= DdConfigService.Current;
+        var config = ActiveConfiguration;
+        ApplyRuntimeConfiguration(config);
 
         static void KeybindPress(object? sender, KeyboardHookEventArgs e)
         {
@@ -680,6 +953,7 @@ public static class Drawing
         Input.taskHook.KeyReleased += KeybindRelease;
 
         IsDrawing = true;
+        if (!_progressMuted) ReportProgress(0, 0, true);
         var usedPos = position;
 
         Dispatcher.UIThread.Invoke(() =>
@@ -704,13 +978,13 @@ public static class Drawing
             _dataDisplay.DataDisplayText.Text =
                 $"Getting Chunks...";
         });
-        List<Dictionary<Vector2, int>> Chunks = GetChunks(bitmap);
         Dispatcher.UIThread.Invoke(() =>
         {
             _dataDisplay.DataDisplayText.Text =
                 $"Generating Action Path...";
         });
-        List<List<Vector2>> Actions = GenerateActions(Chunks,dataArray);
+        List<List<Vector2>> Actions = GenerateActions(dataArray);
+        if (!_progressMuted) ReportProgress(0, Actions.Sum(action => (long)action.Count), true);
 
         int ActionsComplete = 0;
         foreach (List<Vector2> Action in Actions)
@@ -724,13 +998,17 @@ public static class Drawing
             {
                 ActionComplete++;
                 if (!IsDrawing) break;
-                short x = (short)(p.X + startPos.X);
-                short y = (short)(p.Y + startPos.Y);
+                short x = (short)(p.X * config.PixelSize + startPos.X);
+                short y = (short)(p.Y * config.PixelSize + startPos.Y);
+                if (ClipToRegion && (x < config.DrawRegion.Left || y < config.DrawRegion.Top ||
+                    x > config.DrawRegion.Right || y > config.DrawRegion.Bottom)) continue;
+                ReportProgress(ProgressDrawn + 1, ProgressTotal);
                 Dispatcher.UIThread.Invoke(() => // Note, this may be slowing down the top-speed, need further testing.
                 {
                     _dataDisplay.DataDisplayText.Text =
                         $"ActionSet Completed: {ActionComplete}/{Action.Count}\n" +
-                        $"ActionSet's Remaining: {ActionsComplete}/{Actions.Count}";
+                        $"ActionSet's Remaining: {ActionsComplete}/{Actions.Count}\n" +
+                        $"Progress: {ProgressPercent:0.0}%  Pixels: {ProgressDrawn}/{ProgressTotal}";
                 });
                 if (!isDown)
                 {
@@ -803,7 +1081,13 @@ public static class Drawing
         Input.taskHook.KeyPressed -= KeybindPress;
         Input.taskHook.KeyReleased -= KeybindRelease;
 
+        var completed = IsDrawing;
         IsDrawing = false;
+        if (!_progressMuted)
+        {
+            ActiveConfiguration = null;
+            ReportProgress(completed ? ProgressTotal : ProgressDrawn, ProgressTotal, true);
+        }
         Dispatcher.UIThread.Invoke(() =>
         {
             _dataDisplay.Close();

@@ -141,6 +141,7 @@
                         <Label Grid.Row="8" Grid.Column="0" Padding="0" VerticalContentAlignment="Center">Skip Backtrace:</Label>
                         <Button Grid.Row="8" Grid.Column="1" Name="ChangeKeybind_SkipBacktrace">Backslash</Button>
                     </Grid>
+                    <Button Name="ColorPickerHelpButton" HorizontalAlignment="Left" Margin="0,8,0,0">Color Picker Help</Button>
                 </StackPanel>
             </Grid>
             
