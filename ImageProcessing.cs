@@ -60,11 +60,27 @@ public static class ImageProcessing
     }
 
     private static unsafe void GetPixel(uint* input, out byte red, out byte green, out byte blue, out byte alpha)
+        => GetPixel(input, rgba: true, out red, out green, out blue, out alpha);
+
+    /// <summary>Reads a packed 8888 pixel in the bitmap's actual channel order.  The parameterless
+    /// overload assumes RGBA; BGRA sources (Skia's Windows default) need the explicit flag or red
+    /// and blue are swapped for every colour-sensitive pass.</summary>
+    private static unsafe void GetPixel(uint* input, bool rgba, out byte red, out byte green, out byte blue, out byte alpha)
     {
-        red = (byte)(*input & 0xFF);
-        green = (byte)((*input >> 8) & 0xFF);
-        blue = (byte)((*input >> 16) & 0xFF);
-        alpha = (byte)((*input >> 24) & 0xFF);
+        var value = *input;
+        if (rgba)
+        {
+            red = (byte)(value & 0xFF);
+            green = (byte)((value >> 8) & 0xFF);
+            blue = (byte)((value >> 16) & 0xFF);
+        }
+        else
+        {
+            blue = (byte)(value & 0xFF);
+            green = (byte)((value >> 8) & 0xFF);
+            red = (byte)((value >> 16) & 0xFF);
+        }
+        alpha = (byte)((value >> 24) & 0xFF);
     }
 
     public static byte AdjustThresh(byte rByte, byte gByte, byte bByte, byte aByte, bool doinvert, float maxthresh, float minthresh, byte athresh)
@@ -501,63 +517,130 @@ public static class ImageProcessing
     /// go through <see cref="Autodraw.Painting.ColorMatcher.DeltaE2000Lab"/> so this matches the
     /// layer assignment pass exactly.
     /// </summary>
-    public static unsafe List<SKColor> ExtractPalette(SKBitmap sourceBitmap, int paletteSize, byte alphaThreshold, AutoDrawConfig? config = null)
+    public static unsafe List<SKColor> ExtractPalette(SKBitmap sourceBitmap, int paletteSize, byte alphaThreshold, AutoDrawConfig? config = null, bool preprocess = true)
     {
+        ArgumentNullException.ThrowIfNull(sourceBitmap);
         paletteSize = Math.Clamp(paletteSize, 1, 64);
 
-        var histogram = BuildHistogram(sourceBitmap, alphaThreshold, config);
-        if (histogram.Count == 0) return new();
+        // A captured target palette is a hard colour constraint, not a KMeans seed. Every captured
+        // swatch is returned, even when the user asked for fewer palette colours: filtering them
+        // would invent colours that do not exist in the target application. LxPainter's
+        // Palette Match path also uses len(palette_rgb) as k_actual.
+        if (config?.CapturedPalette is { Count: > 0 })
+        {
+            var fixedPalette = config.CapturedPalette
+                .Select(value => SKColor.TryParse(value, out var color) ? color : SKColors.Transparent)
+                .Where(color => color != SKColors.Transparent)
+                .Distinct()
+                .ToList();
+            if (fixedPalette.Count > 0) return fixedPalette;
+        }
 
-        // Scale candidate count with actual unique-color diversity, but never exceed the histogram.
-        var candidateBudget = Math.Max(paletteSize * 8, Math.Min(histogram.Count, paletteSize * 64));
-        var candidates = histogram
-            .OrderByDescending(entry => entry.Value)
-            .Take(candidateBudget)
-            .Select(entry =>
-            {
-                var red = ((entry.Key >> 10) & 31) * 8 + 4;
-                var green = ((entry.Key >> 5) & 31) * 8 + 4;
-                var blue = (entry.Key & 31) * 8 + 4;
-                return (Color: new SKColor((byte)red, (byte)green, (byte)blue), Weight: entry.Value);
-            })
-            .ToList();
+        // LxPainter applies the LAB spatial filter and SEEDS superpixels to the pixels used for
+        // clustering, not just to the palette.  The analyzer calls this same helper so masks and
+        // palette are produced from the identical image.
+        SKBitmap? preprocessing = null;
+        var prepared = sourceBitmap;
+        if (preprocess)
+        {
+            preprocessing = PrepareQuantizationSource(sourceBitmap, config);
+            prepared = preprocessing;
+        }
 
-        // If the image genuinely has fewer distinct colours than the requested palette, return
-        // exactly those colours rather than inventing centroids from noise.
-        if (candidates.Count <= paletteSize)
-            return candidates.Select(c => c.Color).Distinct().ToList();
+        try
+        {
+            var histogram = BuildHistogram(prepared, alphaThreshold, config);
+            if (histogram.Count == 0) return new();
 
-        var quantize = config?.QuantizeMethod ?? string.Empty;
-        if (quantize.Contains("div", StringComparison.OrdinalIgnoreCase) ||
-            quantize.Contains("wu", StringComparison.OrdinalIgnoreCase))
-            return DivQuantizer(candidates, paletteSize);
-        if (quantize.Contains("median", StringComparison.OrdinalIgnoreCase) ||
-            quantize.Contains("lab color", StringComparison.OrdinalIgnoreCase))
-            return MedianCut(candidates, paletteSize);
+            // Scale candidate count with actual unique-color diversity, but never exceed the histogram.
+            var candidateBudget = Math.Max(paletteSize * 8, Math.Min(histogram.Count, paletteSize * 64));
+            var candidates = histogram
+                .OrderByDescending(entry => entry.Value)
+                .Take(candidateBudget)
+                .Select(entry =>
+                {
+                    var red = ((entry.Key >> 10) & 31) * 8 + 4;
+                    var green = ((entry.Key >> 5) & 31) * 8 + 4;
+                    var blue = (entry.Key & 31) * 8 + 4;
+                    return (Color: new SKColor((byte)red, (byte)green, (byte)blue), Weight: entry.Value);
+                })
+                .ToList();
 
-        // Default path: KMeans++.  The legacy "NeuQuant Neural-Net", MiniBatch and NeuQuant labels are
-        // treated as the KMeans path, matching the historical (silent) behaviour.
-        return KMeans(candidates, paletteSize, config);
+            // If the image genuinely has fewer distinct colours than the requested palette, return
+            // exactly those colours rather than inventing centroids from noise.
+            if (candidates.Count <= paletteSize)
+                return candidates.Select(c => c.Color).Distinct().ToList();
+
+            var quantize = (config?.QuantizeMethod ?? string.Empty).Trim();
+
+            // Each LxPainter quantizer keeps its own algorithm.  Previously Wu, NeuQuant, Lab and
+            // MiniBatch were silently collapsed into KMeans/Div/MedianCut.
+            if (quantize.Contains("wu", StringComparison.OrdinalIgnoreCase))
+                return WuQuantizer(candidates, paletteSize);
+            if (quantize.Contains("neuquant", StringComparison.OrdinalIgnoreCase))
+                return NeuQuantQuantizer(candidates, paletteSize);
+            if (quantize.Contains("median", StringComparison.OrdinalIgnoreCase))
+                return MedianCut(candidates, paletteSize);
+            if (quantize.Contains("div", StringComparison.OrdinalIgnoreCase) ||
+                quantize.Contains("lcquant", StringComparison.OrdinalIgnoreCase))
+                return DivQuantizer(candidates, paletteSize);
+            if (quantize.Contains("minibatch", StringComparison.OrdinalIgnoreCase))
+                return KMeans(candidates, paletteSize, config, miniBatch: true);
+
+            // KMeans++ / KMeans (Random) / Lab Color Space / CIELAB / OKLAB / RGB all use KMeans in
+            // the colour space selected by the quantizer name (or an explicit assignment override).
+            return KMeans(candidates, paletteSize, config);
+        }
+        finally
+        {
+            preprocessing?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Applies the preprocessing that LxPainter performs before clustering: LAB spatial
+    /// smoothing/edge blending for the "Lab Color Space" quantizer and its SLIC-style SEEDS
+    /// superpixels when enabled. The caller owns the returned bitmap.
+    /// </summary>
+    public static SKBitmap PrepareQuantizationSource(SKBitmap source, AutoDrawConfig? config)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var current = source.Copy();
+        if (config is null) return current;
+
+        var method = config.QuantizeMethod ?? string.Empty;
+        if (method.Contains("lab color", StringComparison.OrdinalIgnoreCase))
+        {
+            var filtered = ApplyLabSpatialFeatures(current, config);
+            current.Dispose();
+            current = filtered;
+        }
+
+        // Reference only skips SEEDS for the external Lcquant executable.
+        if (config.UseSeeds && !method.Contains("lcquant", StringComparison.OrdinalIgnoreCase))
+        {
+            var seeds = ApplySeedsSuperpixels(current, config.SeedsCount);
+            current.Dispose();
+            current = seeds;
+        }
+
+        return current;
     }
 
     private static unsafe Dictionary<int, int> BuildHistogram(SKBitmap sourceBitmap, byte alphaThreshold, AutoDrawConfig? config)
     {
         var histogram = new Dictionary<int, int>();
         var sourcePtr = (uint*)sourceBitmap.GetPixels().ToPointer();
+        var rgba = sourceBitmap.ColorType == SKColorType.Rgba8888;
         var width = sourceBitmap.Width;
         var height = sourceBitmap.Height;
         var pixelCount = width * height;
 
-        // SeedsCount controls how many pixels vote.  Each sampled pixel votes with its *own*
-        // quantized colour - never with a cell average - so thin edges and saturated accents
-        // remain represented.
-        var step = 1;
-        if (config?.UseSeeds == true && config.SeedsCount > 0)
-            step = Math.Max(1, pixelCount / config.SeedsCount);
-
-        for (var i = 0; i < pixelCount; i += step)
+        // SEEDS is a real superpixel pass in PrepareQuantizationSource; it must not be
+        // approximated here by sampling every Nth pixel.
+        for (var i = 0; i < pixelCount; i++)
         {
-            GetPixel(sourcePtr + i, out var red, out var green, out var blue, out var alpha);
+            GetPixel(sourcePtr + i, rgba, out var red, out var green, out var blue, out var alpha);
             if (alpha < alphaThreshold) continue;
             var redBin = red >> 3;
             var greenBin = green >> 3;
@@ -568,7 +651,7 @@ public static class ImageProcessing
         return histogram;
     }
 
-    private static List<SKColor> KMeans(List<(SKColor Color, int Weight)> candidates, int paletteSize, AutoDrawConfig? config)
+    private static List<SKColor> KMeans(List<(SKColor Color, int Weight)> candidates, int paletteSize, AutoDrawConfig? config, bool miniBatch = false)
     {
         var candidateCoords = new (double X, double Y, double Z)[candidates.Count];
         for (var i = 0; i < candidates.Count; i++)
@@ -642,12 +725,35 @@ public static class ImageProcessing
 
         const int maxIterations = 64;
         const double convergenceThreshold = 0.5;
+        var miniBatchSize = Math.Clamp(candidates.Count / 8, 32, 512);
         for (var iteration = 0; iteration < maxIterations; iteration++)
         {
             var xTotals = new double[centroids.Count];
             var yTotals = new double[centroids.Count];
             var zTotals = new double[centroids.Count];
             var weights = new long[centroids.Count];
+
+            if (miniBatch)
+            {
+                // MiniBatchKMeans updates from a random sample per iteration with a decaying
+                // learning rate instead of making a full pass over every candidate.
+                var sampleCount = Math.Min(miniBatchSize, candidates.Count);
+                var learningRate = 1.0 / (1.0 + iteration * 0.15);
+                for (var s = 0; s < sampleCount; s++)
+                {
+                    var i = random.Next(candidates.Count);
+                    var closest = ClosestSpaceCentroid(candidateCoords[i], centroids, config);
+                    var weight = Math.Max(1, candidates[i].Weight);
+                    var current = centroids[closest];
+                    centroids[closest] = (
+                        current.X + (candidateCoords[i].X - current.X) * learningRate * weight / (weight + 1),
+                        current.Y + (candidateCoords[i].Y - current.Y) * learningRate * weight / (weight + 1),
+                        current.Z + (candidateCoords[i].Z - current.Z) * learningRate * weight / (weight + 1));
+                }
+
+                if (learningRate < 0.02) break;
+                continue;
+            }
 
             for (var i = 0; i < candidates.Count; i++)
             {
@@ -829,6 +935,151 @@ public static class ImageProcessing
         }).ToList();
     }
 
+    /// <summary>LxPainter's "Wu's Quantizer": variance-minimising box splits with a weighted
+    /// median cut and the box carrying the largest total weighted variance split first.</summary>
+    private static List<SKColor> WuQuantizer(List<(SKColor Color, int Weight)> candidates, int paletteSize)
+    {
+        var boxes = new List<List<(SKColor Color, int Weight)>> { candidates };
+        while (boxes.Count < paletteSize)
+        {
+            var bestIndex = -1;
+            var bestScore = -1d;
+            var bestChannel = 0;
+            for (var i = 0; i < boxes.Count; i++)
+            {
+                var box = boxes[i];
+                if (box.Count < 2) continue;
+                var totalWeight = box.Sum(c => (double)c.Weight);
+                if (totalWeight <= 0) continue;
+                var mean = new[]
+                {
+                    box.Sum(c => c.Color.Red * (double)c.Weight) / totalWeight,
+                    box.Sum(c => c.Color.Green * (double)c.Weight) / totalWeight,
+                    box.Sum(c => c.Color.Blue * (double)c.Weight) / totalWeight
+                };
+                var variances = new double[3];
+                foreach (var c in box)
+                {
+                    var w = c.Weight / totalWeight;
+                    variances[0] += w * (c.Color.Red - mean[0]) * (c.Color.Red - mean[0]);
+                    variances[1] += w * (c.Color.Green - mean[1]) * (c.Color.Green - mean[1]);
+                    variances[2] += w * (c.Color.Blue - mean[2]) * (c.Color.Blue - mean[2]);
+                }
+                var score = variances[0] + variances[1] + variances[2];
+                if (score <= bestScore) continue;
+                bestScore = score;
+                bestIndex = i;
+                bestChannel = Array.IndexOf(variances, variances.Max());
+            }
+
+            if (bestIndex < 0) break;
+
+            var target = boxes[bestIndex];
+            boxes.RemoveAt(bestIndex);
+            var ordered = target.OrderBy(c => Channel(c.Color, bestChannel)).ToList();
+            var half = ordered.Sum(c => (double)c.Weight) / 2d;
+            var accumulated = 0d;
+            var split = 1;
+            for (; split < ordered.Count; split++)
+            {
+                accumulated += ordered[split - 1].Weight;
+                if (accumulated >= half) break;
+            }
+            if (split <= 0) split = 1;
+            if (split >= ordered.Count) split = Math.Max(1, ordered.Count - 1);
+            boxes.Add(ordered.Take(split).ToList());
+            boxes.Add(ordered.Skip(split).ToList());
+        }
+
+        return boxes.Select(box =>
+        {
+            var totalWeight = box.Sum(c => c.Weight);
+            if (totalWeight <= 0) return new SKColor(0, 0, 0);
+            return new SKColor(
+                (byte)Math.Clamp((int)Math.Round(box.Sum(c => c.Color.Red * c.Weight) / (double)totalWeight), 0, 255),
+                (byte)Math.Clamp((int)Math.Round(box.Sum(c => c.Color.Green * c.Weight) / (double)totalWeight), 0, 255),
+                (byte)Math.Clamp((int)Math.Round(box.Sum(c => c.Color.Blue * c.Weight) / (double)totalWeight), 0, 255));
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Competitive-learning (NeuQuant-style) quantizer. It samples weighted pixels and moves the
+    /// best-matching neuron plus a shrinking one-dimensional neighbourhood in RGB, instead of
+    /// running KMeans. This is a faithful behavioural stand-in, not bit-identical to the original
+    /// C NeuQuant network.
+    /// </summary>
+    private static List<SKColor> NeuQuantQuantizer(List<(SKColor Color, int Weight)> candidates, int paletteSize)
+    {
+        var random = new Random(0);
+        var neurons = new (double R, double G, double B)[paletteSize];
+        var totalWeight = candidates.Sum(c => (long)Math.Max(1, c.Weight));
+        var cumulative = new long[candidates.Count];
+        long running = 0;
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            running += Math.Max(1, candidates[i].Weight);
+            cumulative[i] = running;
+        }
+
+        int PickWeighted()
+        {
+            var target = random.NextInt64(Math.Max(1, running));
+            var index = Array.BinarySearch(cumulative, target + 1);
+            if (index < 0) index = ~index;
+            return Math.Clamp(index, 0, candidates.Count - 1);
+        }
+
+        for (var i = 0; i < neurons.Length; i++)
+        {
+            var c = candidates[PickWeighted()].Color;
+            neurons[i] = (c.Red, c.Green, c.Blue);
+        }
+
+        const int epochs = 32;
+        const int samplesPerEpoch = 2048;
+        var learningRate = 0.5;
+        for (var epoch = 0; epoch < epochs; epoch++)
+        {
+            var radius = Math.Max(0, (int)Math.Round((paletteSize / 4d) * (1d - epoch / (double)epochs)));
+            for (var sample = 0; sample < samplesPerEpoch; sample++)
+            {
+                var index = PickWeighted();
+                var c = candidates[index].Color;
+                var best = 0;
+                var bestDistance = double.MaxValue;
+                for (var n = 0; n < neurons.Length; n++)
+                {
+                    var dr = neurons[n].R - c.Red;
+                    var dg = neurons[n].G - c.Green;
+                    var db = neurons[n].B - c.Blue;
+                    var distance = dr * dr + dg * dg + db * db;
+                    if (distance >= bestDistance) continue;
+                    bestDistance = distance;
+                    best = n;
+                }
+
+                var low = Math.Max(0, best - radius);
+                var high = Math.Min(neurons.Length - 1, best + radius);
+                for (var n = low; n <= high; n++)
+                {
+                    var falloff = 1d - Math.Abs(n - best) / (double)(radius + 1);
+                    var rate = learningRate * falloff;
+                    neurons[n] = (
+                        neurons[n].R + (c.Red - neurons[n].R) * rate,
+                        neurons[n].G + (c.Green - neurons[n].G) * rate,
+                        neurons[n].B + (c.Blue - neurons[n].B) * rate);
+                }
+            }
+            learningRate = Math.Max(0.02, learningRate * 0.9);
+        }
+
+        var colors = neurons.Select(n => new SKColor(
+            (byte)Math.Clamp((int)Math.Round(n.R), 0, 255),
+            (byte)Math.Clamp((int)Math.Round(n.G), 0, 255),
+            (byte)Math.Clamp((int)Math.Round(n.B), 0, 255))).ToList();
+        return MergeToTargetSize(colors, candidates, paletteSize, null);
+    }
+
     private static int Channel(SKColor color, int channel) => channel == 0 ? color.Red : channel == 1 ? color.Green : color.Blue;
     private static int WidestChannel(List<(SKColor Color, int Weight)> box)
     {
@@ -845,9 +1096,35 @@ public static class ImageProcessing
         return WeightedSpaceDistance(a.X, a.Y, a.Z, b.X, b.Y, b.Z, config);
     }
 
+    /// <summary>
+    /// Resolves the colour space used for clustering and nearest-palette assignment.  An explicit
+    /// <see cref="AutoDrawConfig.ColorDistanceMethod"/> wins; otherwise the LxPainter quantizer
+    /// name selects the space, with KMeans++/Wu/NeuQuant/median/div operating in RGB.
+    /// </summary>
+    public static string ResolveColorSpace(AutoDrawConfig? config)
+    {
+        if (config is null) return "RGB";
+
+        var explicitSpace = (config.ColorDistanceMethod ?? string.Empty).Trim().ToUpperInvariant();
+        if (explicitSpace.Length > 0)
+        {
+            return explicitSpace switch
+            {
+                "RGB" or "SRGB" => "RGB",
+                "OKLAB" => "OKLAB",
+                _ => "CIELAB"
+            };
+        }
+
+        var method = (config.QuantizeMethod ?? string.Empty).ToUpperInvariant();
+        if (method.Contains("OKLAB")) return "OKLAB";
+        if (method.Contains("LAB COLOR") || method.Contains("CIELAB")) return "CIELAB";
+        return "RGB";
+    }
+
     private static (double X, double Y, double Z) ToColorSpace(SKColor color, AutoDrawConfig? config)
     {
-        var method = (config?.ColorDistanceMethod ?? "CIELAB").ToUpperInvariant();
+        var method = ResolveColorSpace(config);
         switch (method)
         {
             case "RGB":
@@ -863,7 +1140,7 @@ public static class ImageProcessing
 
     private static SKColor FromColorSpace(double x, double y, double z, AutoDrawConfig? config)
     {
-        var method = (config?.ColorDistanceMethod ?? "CIELAB").ToUpperInvariant();
+        var method = ResolveColorSpace(config);
         switch (method)
         {
             case "RGB":
@@ -880,13 +1157,13 @@ public static class ImageProcessing
     {
         if (config is null)
         {
-            var dx = x1 - x2;
-            var dy = y1 - y2;
-            var dz = z1 - z2;
-            return dx * dx + dy * dy + dz * dz;
+            var dx0 = x1 - x2;
+            var dy0 = y1 - y2;
+            var dz0 = z1 - z2;
+            return dx0 * dx0 + dy0 * dy0 + dz0 * dz0;
         }
 
-        var method = (config.ColorDistanceMethod ?? "CIELAB").ToUpperInvariant();
+        var method = ResolveColorSpace(config);
         if (method == "CIELAB")
         {
             var dl = (x1 - x2) * config.LabLumWeight;
@@ -1022,6 +1299,398 @@ public static class ImageProcessing
         return closest;
     }
 
+    /// <summary>
+    /// LxPainter's "Lab Color Space" preprocessing: bilateral smoothing inside CIELAB, blended
+    /// with the original LAB values through a Sobel edge mask.  The result is converted back to
+    /// RGB so the rest of the pipeline can use it like any other bitmap.
+    /// </summary>
+    public static SKBitmap ApplyLabSpatialFeatures(SKBitmap source, AutoDrawConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var width = source.Width;
+        var height = source.Height;
+        var count = width * height;
+        var l = new double[count];
+        var a = new double[count];
+        var b = new double[count];
+        var alpha = new byte[count];
+
+        var fourByte = source.BytesPerPixel == 4 && source.GetPixels() != IntPtr.Zero;
+        var rowBytes = source.RowBytes;
+        var rgba = source.ColorType == SKColorType.Rgba8888;
+        var redOffset = rgba ? 0 : 2;
+        var blueOffset = rgba ? 2 : 0;
+        unsafe
+        {
+            var pixels = fourByte ? (byte*)source.GetPixels().ToPointer() : null;
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+            {
+                var index = y * width + x;
+                SKColor color;
+                if (pixels is not null)
+                {
+                    var p = pixels + y * rowBytes + x * 4;
+                    color = new SKColor(p[redOffset], p[1], p[blueOffset], p[3]);
+                    alpha[index] = p[3];
+                }
+                else
+                {
+                    color = source.GetPixel(x, y);
+                    alpha[index] = color.Alpha;
+                }
+                ColorMatcher.ToLab(color, out l[index], out a[index], out b[index]);
+            }
+        }
+
+        var iterations = Math.Clamp(config.LabSpatialIterations, 1, 8);
+        var radius = Math.Clamp((int)Math.Round(config.LabSpatialSigma / 2d), 1, 4);
+        var diameter = radius * 2 + 1;
+        var spaceSigma = Math.Max(config.LabSpatialSigma, .001);
+        var rangeSigma = Math.Max(config.LabRangeSigma, .001);
+        var spatialWeights = new double[diameter * diameter];
+        for (var dy = -radius; dy <= radius; dy++)
+        for (var dx = -radius; dx <= radius; dx++)
+            spatialWeights[(dy + radius) * diameter + dx + radius] =
+                Math.Exp(-(dx * dx + dy * dy) / (2 * spaceSigma * spaceSigma));
+
+        var smoothL = (double[])l.Clone();
+        var smoothA = (double[])a.Clone();
+        var smoothB = (double[])b.Clone();
+        var scratchL = new double[count];
+        var scratchA = new double[count];
+        var scratchB = new double[count];
+        for (var iteration = 0; iteration < iterations; iteration++)
+        {
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+            {
+                var index = y * width + x;
+                if (alpha[index] == 0)
+                {
+                    scratchL[index] = smoothL[index];
+                    scratchA[index] = smoothA[index];
+                    scratchB[index] = smoothB[index];
+                    continue;
+                }
+
+                double totalL = 0, totalA = 0, totalB = 0, total = 0;
+                for (var dy = -radius; dy <= radius; dy++)
+                {
+                    var ny = y + dy;
+                    if (ny < 0 || ny >= height) continue;
+                    for (var dx = -radius; dx <= radius; dx++)
+                    {
+                        var nx = x + dx;
+                        if (nx < 0 || nx >= width) continue;
+                        var neighbour = ny * width + nx;
+                        if (alpha[neighbour] == 0) continue;
+
+                        var dl = smoothL[neighbour] - smoothL[index];
+                        var da = smoothA[neighbour] - smoothA[index];
+                        var db = smoothB[neighbour] - smoothB[index];
+                        var range = dl * dl + da * da + db * db;
+                        var weight = spatialWeights[(dy + radius) * diameter + dx + radius]
+                                     * Math.Exp(-range / (2 * rangeSigma * rangeSigma));
+                        totalL += smoothL[neighbour] * weight;
+                        totalA += smoothA[neighbour] * weight;
+                        totalB += smoothB[neighbour] * weight;
+                        total += weight;
+                    }
+                }
+
+                if (total <= 0)
+                {
+                    scratchL[index] = smoothL[index];
+                    scratchA[index] = smoothA[index];
+                    scratchB[index] = smoothB[index];
+                }
+                else
+                {
+                    scratchL[index] = totalL / total;
+                    scratchA[index] = totalA / total;
+                    scratchB[index] = totalB / total;
+                }
+            }
+
+            (smoothL, scratchL) = (scratchL, smoothL);
+            (smoothA, scratchA) = (scratchA, smoothA);
+            (smoothB, scratchB) = (scratchB, smoothB);
+        }
+
+        // Sobel gradient magnitude of L, normalised to 0..100 exactly like the reference.
+        var gradient = new double[count];
+        var maxGradient = 0d;
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+        {
+            var gx = 0d;
+            var gy = 0d;
+            if (x > 0 && x < width - 1 && y > 0 && y < height - 1)
+            {
+                var top = (y - 1) * width;
+                var middle = y * width;
+                var bottom = (y + 1) * width;
+                gx = -l[top + x - 1] + l[top + x + 1]
+                     - 2 * l[middle + x - 1] + 2 * l[middle + x + 1]
+                     - l[bottom + x - 1] + l[bottom + x + 1];
+                gy = -l[top + x - 1] - 2 * l[top + x] - l[top + x + 1]
+                     + l[bottom + x - 1] + 2 * l[bottom + x] + l[bottom + x + 1];
+            }
+            var magnitude = Math.Sqrt(gx * gx + gy * gy);
+            gradient[y * width + x] = magnitude;
+            if (magnitude > maxGradient) maxGradient = magnitude;
+        }
+
+        var contrast = Math.Max(config.LabContrastThreshold, 1e-5);
+        var power = Math.Max(.1, 100d / Math.Max(config.LabEdgePreservation, 1e-5));
+        var output = new SKBitmap(width, height, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+        unsafe
+        {
+            var outputPixels = (byte*)output.GetPixels().ToPointer();
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+            {
+                var index = y * width + x;
+                var normalized = maxGradient > 0 ? gradient[index] / maxGradient * 100d : 0d;
+                var edgeMask = Math.Clamp(normalized / contrast, 0d, 1d);
+                edgeMask = Math.Pow(edgeMask, power);
+
+                var outL = l[index] * edgeMask + smoothL[index] * (1 - edgeMask);
+                var outA = a[index] * edgeMask + smoothA[index] * (1 - edgeMask);
+                var outB = b[index] * edgeMask + smoothB[index] * (1 - edgeMask);
+                var color = LabToRgb(outL, outA, outB);
+                var p = outputPixels + y * output.RowBytes + x * 4;
+                // Output is Bgra8888; write the bytes in memory order.
+                p[0] = color.Blue;
+                p[1] = color.Green;
+                p[2] = color.Red;
+                p[3] = alpha[index];
+            }
+        }
+
+        return output;
+    }
+
+    /// <summary>
+    /// SLIC-style SEEDS superpixels in OKLab with boundary-only neighbour reassignment and a
+    /// gradient edge weight, followed by the mean RGB of every superpixel. This replaces the old
+    /// histogram stride that only sampled every Nth pixel.
+    /// </summary>
+    public static SKBitmap ApplySeedsSuperpixels(SKBitmap source, int desiredCount, int iterations = 10)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var width = source.Width;
+        var height = source.Height;
+        if (width <= 0 || height <= 0) return source.Copy();
+
+        desiredCount = Math.Clamp(desiredCount, 1, 10_000_000);
+        iterations = Math.Clamp(iterations, 0, 20);
+        var count = width * height;
+        var l = new double[count];
+        var a = new double[count];
+        var b = new double[count];
+        var red = new byte[count];
+        var green = new byte[count];
+        var blue = new byte[count];
+        var alpha = new byte[count];
+
+        var fourByte = source.BytesPerPixel == 4 && source.GetPixels() != IntPtr.Zero;
+        var rowBytes = source.RowBytes;
+        var rgba = source.ColorType == SKColorType.Rgba8888;
+        var redOffset = rgba ? 0 : 2;
+        var blueOffset = rgba ? 2 : 0;
+        unsafe
+        {
+            var pixels = fourByte ? (byte*)source.GetPixels().ToPointer() : null;
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+            {
+                var index = y * width + x;
+                SKColor color;
+                if (pixels is not null)
+                {
+                    var p = pixels + y * rowBytes + x * 4;
+                    color = new SKColor(p[redOffset], p[1], p[blueOffset], p[3]);
+                }
+                else
+                {
+                    color = source.GetPixel(x, y);
+                }
+
+                red[index] = color.Red;
+                green[index] = color.Green;
+                blue[index] = color.Blue;
+                alpha[index] = color.Alpha;
+                var lab = RgbToOkLab(color);
+                l[index] = lab.X;
+                a[index] = lab.Y;
+                b[index] = lab.Z;
+            }
+        }
+
+        var gradient = new double[count];
+        var maxGradient = 0d;
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+        {
+            var dx = x + 1 < width ? l[y * width + x + 1] - l[y * width + x] : 0;
+            var dy = y + 1 < height ? l[(y + 1) * width + x] - l[y * width + x] : 0;
+            var magnitude = dx * dx + dy * dy;
+            gradient[y * width + x] = magnitude;
+            if (magnitude > maxGradient) maxGradient = magnitude;
+        }
+        if (maxGradient > 0)
+            for (var i = 0; i < count; i++) gradient[i] /= maxGradient;
+
+        var blockSize = Math.Max(1, (int)Math.Sqrt(count / (double)desiredCount));
+        var blocksX = (int)Math.Ceiling(width / (double)blockSize);
+        var blocksY = (int)Math.Ceiling(height / (double)blockSize);
+        var labels = new int[count];
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+            labels[y * width + x] = (y / blockSize) * blocksX + x / blockSize;
+
+        var regionCount = blocksX * blocksY;
+        var regionCounts = new int[regionCount];
+        var sumL = new double[regionCount];
+        var sumA = new double[regionCount];
+        var sumB = new double[regionCount];
+        var meanL = new double[regionCount];
+        var meanA = new double[regionCount];
+        var meanB = new double[regionCount];
+        const double edgeWeight = 10d;
+        var neighbours = new int[4];
+
+        for (var iteration = 0; iteration < iterations; iteration++)
+        {
+            Array.Clear(regionCounts);
+            Array.Clear(sumL);
+            Array.Clear(sumA);
+            Array.Clear(sumB);
+            for (var i = 0; i < count; i++)
+            {
+                var region = labels[i];
+                regionCounts[region]++;
+                sumL[region] += l[i];
+                sumA[region] += a[i];
+                sumB[region] += b[i];
+            }
+            for (var region = 0; region < regionCount; region++)
+            {
+                if (regionCounts[region] == 0) continue;
+                meanL[region] = sumL[region] / regionCounts[region];
+                meanA[region] = sumA[region] / regionCounts[region];
+                meanB[region] = sumB[region] / regionCounts[region];
+            }
+
+            var anyMove = false;
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+            {
+                if (x == 0 || y == 0 || x == width - 1 || y == height - 1) continue;
+                var index = y * width + x;
+                var region = labels[index];
+                if (region == labels[index - 1] && region == labels[index + 1] &&
+                    region == labels[index - width] && region == labels[index + width])
+                    continue;
+
+                var dl = l[index] - meanL[region];
+                var da = a[index] - meanA[region];
+                var db = b[index] - meanB[region];
+                var currentDistance = dl * dl + da * da + db * db;
+                var edgeFactor = 1d + edgeWeight * gradient[index];
+                var best = region;
+                var bestDistance = currentDistance;
+
+                neighbours[0] = labels[index - 1];
+                neighbours[1] = labels[index + 1];
+                neighbours[2] = labels[index - width];
+                neighbours[3] = labels[index + width];
+                for (var n = 0; n < 4; n++)
+                {
+                    var candidate = neighbours[n];
+                    if (candidate == region) continue;
+                    dl = l[index] - meanL[candidate];
+                    da = a[index] - meanA[candidate];
+                    db = b[index] - meanB[candidate];
+                    var distance = dl * dl + da * da + db * db;
+                    if (!(distance * edgeFactor + 1e-5 < bestDistance)) continue;
+                    bestDistance = distance * edgeFactor;
+                    best = candidate;
+                }
+
+                if (best == region) continue;
+
+                var oldCount = regionCounts[region];
+                if (oldCount > 1)
+                {
+                    meanL[region] = (meanL[region] * oldCount - l[index]) / (oldCount - 1);
+                    meanA[region] = (meanA[region] * oldCount - a[index]) / (oldCount - 1);
+                    meanB[region] = (meanB[region] * oldCount - b[index]) / (oldCount - 1);
+                }
+                regionCounts[region] = Math.Max(0, oldCount - 1);
+
+                var newCount = regionCounts[best];
+                meanL[best] = (meanL[best] * newCount + l[index]) / (newCount + 1);
+                meanA[best] = (meanA[best] * newCount + a[index]) / (newCount + 1);
+                meanB[best] = (meanB[best] * newCount + b[index]) / (newCount + 1);
+                regionCounts[best] = newCount + 1;
+                labels[index] = best;
+                anyMove = true;
+            }
+
+            if (!anyMove) break;
+        }
+
+        // Mean RGB per final superpixel.
+        Array.Clear(regionCounts);
+        var sumR = new double[regionCount];
+        var sumG = new double[regionCount];
+        var sumBl = new double[regionCount];
+        for (var i = 0; i < count; i++)
+        {
+            var region = labels[i];
+            if (region < 0 || region >= regionCount) continue;
+            regionCounts[region]++;
+            sumR[region] += red[i];
+            sumG[region] += green[i];
+            sumBl[region] += blue[i];
+        }
+        for (var region = 0; region < regionCount; region++)
+        {
+            if (regionCounts[region] == 0) continue;
+            sumR[region] /= regionCounts[region];
+            sumG[region] /= regionCounts[region];
+            sumBl[region] /= regionCounts[region];
+        }
+
+        var output = new SKBitmap(width, height, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+        unsafe
+        {
+            var outputPixels = (byte*)output.GetPixels().ToPointer();
+            for (var y = 0; y < height; y++)
+            for (var x = 0; x < width; x++)
+            {
+                var index = y * width + x;
+                var region = labels[index];
+                var r = region >= 0 && region < regionCount && regionCounts[region] > 0 ? (byte)Math.Clamp((int)Math.Round(sumR[region]), 0, 255) : red[index];
+                var g = region >= 0 && region < regionCount && regionCounts[region] > 0 ? (byte)Math.Clamp((int)Math.Round(sumG[region]), 0, 255) : green[index];
+                var bl = region >= 0 && region < regionCount && regionCounts[region] > 0 ? (byte)Math.Clamp((int)Math.Round(sumBl[region]), 0, 255) : blue[index];
+                var p = outputPixels + y * output.RowBytes + x * 4;
+                // Output is Bgra8888; write the bytes in memory order.
+                p[0] = bl;
+                p[1] = g;
+                p[2] = r;
+                p[3] = alpha[index];
+            }
+        }
+
+        return output;
+    }
+
     public static unsafe List<ColorLayerResult> SplitImageByColors(SKBitmap sourceBitmap, List<SKColor> targetColors, byte alphaThreshold, AutoDrawConfig? config = null)
     {
         var width = sourceBitmap.Width;
@@ -1033,7 +1702,8 @@ public static class ImageProcessing
         for (int i = 0; i < targetColors.Count; i++)
         {
             var color = targetColors[i];
-            var layerBmp = new SKBitmap(width, height);
+            // RGBA so the fast MakePixel writer below and SKBitmap.GetPixel agree on channel order.
+            var layerBmp = new SKBitmap(width, height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
             // Clearing once is much cheaper than writing a transparent pixel into every layer
             // for every source pixel (O(layers * pixels) writes).
             layerBmp.Erase(SKColors.Transparent);
@@ -1044,13 +1714,14 @@ public static class ImageProcessing
         var targetCoords = targetColors.Select(tc => ToColorSpace(tc, config)).ToArray();
 
         var basePtr = (uint*)sourceBitmap.GetPixels().ToPointer();
+        var rgbaSource = sourceBitmap.ColorType == SKColorType.Rgba8888;
 
         for (var y = 0; y < height; y++)
         {
             for (var x = 0; x < width; x++)
             {
                 var srcPtr = basePtr + width * y + x;
-                GetPixel(srcPtr, out var r, out var g, out var b, out var a);
+                GetPixel(srcPtr, rgbaSource, out var r, out var g, out var b, out var a);
 
                 if (a < alphaThreshold) continue;
 
@@ -1076,8 +1747,10 @@ public static class ImageProcessing
         }
 
         if (config?.RemoveStray == true) MergeStrayPixels(results, width, height);
-        if (config?.QuantizeStyle?.Contains("vector", StringComparison.OrdinalIgnoreCase) == true)
-            SmoothLayerAssignments(results, width, height);
+        // SEEDS is already a superpixel pass; smoothing here would be a second, unrelated filter.
+        if (config?.UseSeeds != true &&
+            config?.QuantizeStyle?.Contains("vector", StringComparison.OrdinalIgnoreCase) == true)
+            SmoothLayerAssignments(results, width, height, null);
         return results;
     }
 
@@ -1118,26 +1791,26 @@ public static class ImageProcessing
         var neighbours = new int[layers.Count];
         var pointers = new uint*[layers.Count];
         for (var i = 0; i < layers.Count; i++) pointers[i] = (uint*)layers[i].Bitmap.GetPixels().ToPointer();
-        for (var y = 0; y < height; y++)
-        for (var x = 0; x < width; x++)
+        for (var y = 1; y < height - 1; y++)
+        for (var x = 1; x < width - 1; x++)
         {
             var from = labels[y * width + x];
             if (from < 0) continue;
+
+            // Reference definition: a stray has no identical pixel among its four orthogonal
+            // neighbours. Edge padding makes border pixels never stray.
+            var up = labels[(y - 1) * width + x];
+            var down = labels[(y + 1) * width + x];
+            var left = labels[y * width + x - 1];
+            var right = labels[y * width + x + 1];
+            if (up == from || down == from || left == from || right == from) continue;
+
             Array.Clear(neighbours);
-            var same = 0;
-            for (var dy = -1; dy <= 1; dy++)
-            for (var dx = -1; dx <= 1; dx++)
-            {
-                if (dx == 0 && dy == 0) continue;
-                var nx = x + dx;
-                var ny = y + dy;
-                if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-                var label = labels[ny * width + nx];
-                if (label < 0) continue;
-                if (label == from) same++;
-                else neighbours[label]++;
-            }
-            if (same > 0) continue;
+            if (up >= 0) neighbours[up]++;
+            if (down >= 0) neighbours[down]++;
+            if (left >= 0) neighbours[left]++;
+            if (right >= 0) neighbours[right]++;
+
             var best = -1;
             var bestCount = 0;
             for (var i = 0; i < neighbours.Length; i++)
@@ -1159,40 +1832,61 @@ public static class ImageProcessing
         }
     }
 
-    /// <summary>Majority-vote cleanup used by the Vectorized (Smooth) quantize style.</summary>
-    private static unsafe void SmoothLayerAssignments(IReadOnlyList<ColorLayerResult> layers, int width, int height)
+    /// <summary>Majority-vote cleanup for Vectorized mode, or spatial/range weighted cleanup for SEEDS.</summary>
+    private static unsafe void SmoothLayerAssignments(IReadOnlyList<ColorLayerResult> layers, int width, int height, AutoDrawConfig? config)
     {
         var pointers = new uint*[layers.Count];
         for (var i = 0; i < layers.Count; i++) pointers[i] = (uint*)layers[i].Bitmap.GetPixels().ToPointer();
-        for (var pass = 0; pass < 2; pass++)
+        var spatial = Math.Max(config?.LabSpatialSigma ?? 1d, .001);
+        var range = Math.Max(config?.LabRangeSigma ?? 10d, .001);
+        var edge = Math.Max(config?.LabEdgePreservation ?? 0d, 0d);
+        var radius = config is null ? 1 : Math.Clamp((int)Math.Round(config.LabSpatialSigma), 1, 6);
+        var passes = config is null ? 2 : Math.Clamp(config.LabSpatialIterations, 0, 8);
+        for (var pass = 0; pass < passes; pass++)
         {
             var labels = BuildLabelMap(layers, width, height);
             var moves = new List<(int X, int Y, int From, int To)>();
-            var counts = new int[layers.Count];
+            var counts = new double[layers.Count];
             for (var y = 0; y < height; y++)
             for (var x = 0; x < width; x++)
             {
                 var from = labels[y * width + x];
                 if (from < 0) continue;
                 Array.Clear(counts);
-                var total = 0;
-                for (var dy = -1; dy <= 1; dy++)
-                for (var dx = -1; dx <= 1; dx++)
+                var total = 0d;
+                for (var dy = -radius; dy <= radius; dy++)
+                for (var dx = -radius; dx <= radius; dx++)
                 {
-                    if (dx == 0 && dy == 0) continue;
+                    if (config is null && dx == 0 && dy == 0) continue;
                     var nx = x + dx;
                     var ny = y + dy;
                     if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
                     var label = labels[ny * width + nx];
                     if (label < 0) continue;
-                    counts[label]++;
-                    total++;
+                    var weight = 1d;
+                    if (config is not null)
+                    {
+                        var first = layers[from].Color;
+                        var second = layers[label].Color;
+                        var dr = first.Red - second.Red;
+                        var dg = first.Green - second.Green;
+                        var db = first.Blue - second.Blue;
+                        var difference = dr * dr + dg * dg + db * db;
+                        weight = Math.Exp(-(dx * dx + dy * dy) / (2 * spatial * spatial))
+                                 * Math.Exp(-(1 + edge) * difference / (2 * range * range));
+                    }
+                    counts[label] += weight;
+                    total += weight;
                 }
-                if (total < 4) continue;
                 var best = from;
                 for (var i = 0; i < counts.Length; i++)
                     if (counts[i] > counts[best]) best = i;
-                if (best != from && counts[best] >= 4) moves.Add((x, y, from, best));
+                if (config is null)
+                {
+                    if (total >= 4 && best != from && counts[best] >= 4) moves.Add((x, y, from, best));
+                }
+                else if (best != from && counts[best] > counts[from] * 1.05)
+                    moves.Add((x, y, from, best));
             }
 
             foreach (var (x, y, from, to) in moves)
@@ -1237,19 +1931,56 @@ public static class ImageProcessing
         return labels;
     }
 
+    /// <summary>Applies LxPainter custom dimensions. Zero means automatic; specifying only one
+    /// dimension preserves aspect ratio. The caller owns the returned independent bitmap.</summary>
+    public static SKBitmap ResizeToCustomDimensions(SKBitmap source, AutoDrawConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(config);
+        var width = Math.Max(0, config.CustomWidth);
+        var height = Math.Max(0, config.CustomHeight);
+        if (width == 0 && height == 0) return source.Copy();
+        if (width == 0) width = Math.Max(1, (int)Math.Round(source.Width * (height / (double)source.Height)));
+        if (height == 0) height = Math.Max(1, (int)Math.Round(source.Height * (width / (double)source.Width)));
+        if (width == source.Width && height == source.Height) return source.Copy();
+        return source.Resize(new SKSizeI(width, height), SKFilterQuality.High);
+    }
+
+    /// <summary>Applies LxPainter's Pixel Size Scaling processing resolution: one processed pixel
+    /// covers <paramref name="pixelSize"/> screen pixels. The caller owns the result.</summary>
+    public static SKBitmap ResizeForDrawMethod(
+        SKBitmap source,
+        int canvasWidth,
+        int canvasHeight,
+        bool pixelScaling,
+        int pixelSize)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (!pixelScaling) return source.Copy();
+
+        var size = Math.Max(1, pixelSize);
+        var width = Math.Max(1, canvasWidth / size);
+        var height = Math.Max(1, canvasHeight / size);
+        if (width == source.Width && height == source.Height) return source.Copy();
+        return source.Resize(new SKSizeI(width, height), SKFilterQuality.High);
+    }
+
     /// <summary>Copies a bitmap and makes configured background colours transparent before colour quantization.</summary>
     public static SKBitmap PrepareColorImage(SKBitmap source, AutoDrawConfig config)
     {
         var output = source.Copy();
-        var background = config.BackgroundColorsToRemove.Select(SKColor.Parse).ToArray();
-        if (background.Length == 0 && !config.UseBilateral) return output;
-        if (background.Length > 0)
+        var background = config.BackgroundColorsToRemove
+            .Select(value => SKColor.TryParse(value, out var color) ? color : SKColors.Transparent)
+            .Where(color => color != SKColors.Transparent)
+            .ToArray();
+        if ((!config.RemoveBackground || background.Length == 0) && !config.UseBilateral) return output;
+        if (config.RemoveBackground && background.Length > 0)
         {
             for (var y = 0; y < output.Height; y++)
             for (var x = 0; x < output.Width; x++)
             {
                 var c = output.GetPixel(x, y);
-                if (background.Any(bg => ColorMatcher.DeltaE2000(bg, c) <= config.LabContrastThreshold))
+                if (background.Any(bg => IsBackgroundMatch(c, bg, config)))
                     output.SetPixel(x, y, new SKColor(0, 0, 0, 0));
             }
         }
@@ -1257,6 +1988,18 @@ public static class ImageProcessing
         var filtered = ApplyBilateral(output, config);
         output.Dispose();
         return filtered;
+    }
+
+    private static bool IsBackgroundMatch(SKColor color, SKColor background, AutoDrawConfig config)
+    {
+        if (config.BackgroundTolerance is { } tolerance)
+        {
+            var red = color.Red - background.Red;
+            var green = color.Green - background.Green;
+            var blue = color.Blue - background.Blue;
+            return Math.Sqrt(red * red + green * green + blue * blue) <= tolerance;
+        }
+        return ColorMatcher.DeltaE2000(background, color) <= config.LabContrastThreshold;
     }
 
     // Deliberately bounded radius: a configuration import must not turn a large image into an unbounded operation.

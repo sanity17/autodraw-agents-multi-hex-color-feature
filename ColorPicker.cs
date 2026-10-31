@@ -25,10 +25,12 @@ public static class ColorPicker
         "Choose a Picker Type in Settings, then click Calibrate (or press F5).",
         "A guide window tells you exactly what to click for that picker type.",
         "",
+        "HEX: click the hex input field. RGB: click R, G, then B. HSV: click H, S, then V.",
         "Color Circle Wheel: the wheel centre, the rim point where RED is, then the bright and",
         "dark ends of the brightness slider.",
         "Color Box: the hue slider start, the hue slider end, then the colour box's top-left and",
         "bottom-right corners.",
+        "Palette Match: use Capture Palette and click each available swatch; no F5 calibration is needed.",
         "",
         "AutoDraw minimizes during capture; press ESC or Cancel in the guide window to abort.",
         "Everything you configure saves automatically."
@@ -144,26 +146,17 @@ public static class ColorPicker
             PickerType = definition.Id,
             WheelClockwise = string.Equals(config.WheelDirection, "CW", StringComparison.OrdinalIgnoreCase),
             PickerStepDelayMs = Math.Max(0, (int)Math.Round(config.DelayInput * 1000d)),
+            MacrosEnabled = config.EnableMacros,
+            OpenPickerPoint = config.OpenPickerCoordinate,
+            ClosePickerPoint = config.ClosePickerCoordinate,
+            OpenPickerDelayMs = Math.Max(0, (int)Math.Round(config.DelayOpen * 1000d)),
+            ClosePickerDelayMs = Math.Max(0, (int)Math.Round(config.DelayClose * 1000d)),
             SelectionAttempts = Math.Clamp(config.RecreateSelectionAttempts, 1, 10)
         };
 
         var color = SKColor.Parse(hex);
-        if (config.EnableMacros && config.OpenPickerCoordinate is { } open)
-        {
-            await input.ClickAsync(open, CancellationToken.None).ConfigureAwait(false);
-            await options.DelayAsync(Math.Max(0, (int)Math.Round(config.DelayOpen * 1000d)), CancellationToken.None)
-                .ConfigureAwait(false);
-        }
-
-        var picker = definition.Create(input, calibration, options, Utils.Log);
+        var picker = new MacroColorPicker(definition.Create(input, calibration, options, Utils.Log), input, options);
         await picker.SelectColorAsync(color, CancellationToken.None).ConfigureAwait(false);
-
-        if (config.EnableMacros && config.ClosePickerCoordinate is { } close)
-        {
-            await options.DelayAsync(Math.Max(0, (int)Math.Round(config.DelayClose * 1000d)), CancellationToken.None)
-                .ConfigureAwait(false);
-            await input.ClickAsync(close, CancellationToken.None).ConfigureAwait(false);
-        }
     }
 
     /// <summary>Formats a colour the way the target applications expect to see it.</summary>

@@ -150,10 +150,21 @@ public class Utils
         string text = data.ToString() ?? "null";
         Console.WriteLine(text);
         if (!LoggingEnabled) return;
-        if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
-        if (LogObject == null) LogObject = new StreamWriter(LogsPath);
-        LogObject.WriteLine(text);
-        LogObject.Flush();
+
+        // Logging must never take the app down: a second instance shares the same daily log file,
+        // and diagnostics such as the input-hook failure run on background threads where a
+        // throwing log write would become an unhandled exception.
+        try
+        {
+            if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
+            if (LogObject == null) LogObject = new StreamWriter(LogsPath);
+            LogObject.WriteLine(text);
+            LogObject.Flush();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine("Log file unavailable: " + ex.Message);
+        }
     }
 
     public static void Copy(string sourceDirectory, string targetDirectory)

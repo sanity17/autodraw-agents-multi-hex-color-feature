@@ -107,6 +107,7 @@ public partial class MainWindow : Window
     private readonly List<Vector2> _colorPickerCalibrationPoints = new();
     private bool _capturingColorPicker;
     private PickerCalibrationOverlay? _calibrationOverlay;
+    private CalibrationClickWatcher? _calibrationClickWatcher;
     // Screen rect of the guide overlay, cached on the UI thread. The mouse hook runs on
     // a background thread and must never read Avalonia visual properties itself.
     private int _overlayLeft = int.MinValue;
@@ -123,7 +124,18 @@ public partial class MainWindow : Window
     {
         Wheel,
         BoxAll,
-        RecreateCurrentColorPoint
+        WheelCircle,
+        WheelBrightness,
+        BoxHue,
+        BoxSatVal,
+        HexField,
+        Rgb,
+        Hsv,
+        RecreateCurrentColorPoint,
+        OpenPicker,
+        ClosePicker,
+        BackgroundColor,
+        PaletteCapture
     }
 
     private ColorPickerCalibrationMode _calibrationMode = ColorPickerCalibrationMode.Wheel;
@@ -218,9 +230,33 @@ public partial class MainWindow : Window
         LoadSelectButton.Click += LoadSelectedConfig;
         RefreshConfigList(this, null);
 
-        Input.Start();
         Input.taskHook.KeyReleased += ConfigureColorPicker;
         Input.taskHook.KeyPressed += HexedDrawHotkeys;
+        Input.HookFailed += OnInputHookFailed;
+    }
+
+    /// <summary>
+    /// The global input hook is started after the window is shown so Windows has a live
+    /// interactive desktop and message loop. <see cref="Input.Start"/> retries and reports
+    /// failure instead of leaving a faulted task for the finalizer.
+    /// </summary>
+    protected override void OnOpened(EventArgs e)
+    {
+        base.OnOpened(e);
+        Input.Start();
+    }
+
+    private void OnInputHookFailed(object? sender, Exception exception)
+    {
+        Utils.Log("Global input hook is unavailable: " + exception.Message);
+        Dispatcher.UIThread.Post(() =>
+        {
+            HexedStatus("status_hook_failed");
+            if (IsVisible)
+                new MessageBox().ShowMessageBox(
+                    LocalizationManager.T("hook_failed_title"),
+                    LocalizationManager.T("hook_failed_body"));
+        });
     }
 
     /// <summary>Global HexedDrawer hotkeys: F1 area, F2 start/pause, F3 stop, F4 reset, F6 quantize.</summary>
@@ -301,8 +337,9 @@ public partial class MainWindow : Window
     private void ConfigureColorPicker(object? sender, KeyboardHookEventArgs e)
     {
         if (_capturingColorPicker) return;
-        if (e.Data.KeyCode == KeyCode.VcF5)
-            BeginSelectedPickerCalibration();
+        if (e.Data.KeyCode == KeyCode.VcF5) BeginSelectedPickerCalibration();
+        if (e.Data.KeyCode == KeyCode.VcF8) BeginPaletteCapture();
+        if (e.Data.KeyCode == KeyCode.VcF10) BeginBackgroundColorCapture();
     }
 
     /// <summary>Runs the calibration flow for the picker type currently selected in dd.json.
@@ -316,21 +353,68 @@ public partial class MainWindow : Window
         }
         if (_capturingColorPicker) return;
         _hexedDrawWindow?.HideForCalibration();
-        StartColorPickerCalibration(SelectedPickerCalibrationMode());
+        if (DdConfigService.Current.IsPaletteMatchPicker) BeginPaletteCapture();
+        else StartColorPickerCalibration(SelectedPickerCalibrationMode());
+    }
+
+    public void BeginPaletteCapture()
+    {
+        if (!Dispatcher.UIThread.CheckAccess()) { Dispatcher.UIThread.Post(BeginPaletteCapture); return; }
+        if (_capturingColorPicker) return;
+        StartColorPickerCalibration(ColorPickerCalibrationMode.PaletteCapture);
+    }
+
+    public void BeginPickerPartCalibration(string part)
+    {
+        var mode = part switch
+        {
+            "Circle" => ColorPickerCalibrationMode.WheelCircle,
+            "Brightness" => ColorPickerCalibrationMode.WheelBrightness,
+            "Hue" => ColorPickerCalibrationMode.BoxHue,
+            "Box" => ColorPickerCalibrationMode.BoxSatVal,
+            _ => SelectedPickerCalibrationMode()
+        };
+        StartColorPickerCalibration(mode);
     }
 
     /// <summary>Registry id for a picker calibration mode, or null for the current-colour point.</summary>
     private static string? PickerModeId(ColorPickerCalibrationMode mode) => mode switch
     {
-        ColorPickerCalibrationMode.Wheel => "Wheel",
-        ColorPickerCalibrationMode.BoxAll => "Box",
+        ColorPickerCalibrationMode.Wheel or ColorPickerCalibrationMode.WheelCircle or ColorPickerCalibrationMode.WheelBrightness => "Wheel",
+        ColorPickerCalibrationMode.BoxAll or ColorPickerCalibrationMode.BoxHue or ColorPickerCalibrationMode.BoxSatVal => "Box",
+        ColorPickerCalibrationMode.HexField => "HEX",
+        ColorPickerCalibrationMode.Rgb => "RGB",
+        ColorPickerCalibrationMode.Hsv => "HSV",
         _ => null
     };
 
+    private static IReadOnlyList<string> CalibrationPointKeys(ColorPickerCalibrationMode mode)
+    {
+        if (PickerModeId(mode) is not { } pickerId || PickerRegistry.Find(pickerId) is not { } definition)
+            return Array.Empty<string>();
+        return mode switch
+        {
+            ColorPickerCalibrationMode.WheelCircle => new[] { PickerPoints.WheelCenter, PickerPoints.WheelEdge },
+            ColorPickerCalibrationMode.WheelBrightness => new[] { PickerPoints.WheelDark, PickerPoints.WheelBright },
+            ColorPickerCalibrationMode.BoxHue => new[] { PickerPoints.BoxHueStart, PickerPoints.BoxHueEnd },
+            ColorPickerCalibrationMode.BoxSatVal => new[] { PickerPoints.BoxTopLeft, PickerPoints.BoxBottomRight },
+            _ => definition.Points.Select(point => point.Key).ToArray()
+        };
+    }
+
+    private static bool IsPartialPickerCalibration(ColorPickerCalibrationMode mode)
+        => mode is ColorPickerCalibrationMode.WheelCircle or ColorPickerCalibrationMode.WheelBrightness
+            or ColorPickerCalibrationMode.BoxHue or ColorPickerCalibrationMode.BoxSatVal;
+
     private static ColorPickerCalibrationMode SelectedPickerCalibrationMode()
-        => string.Equals(DdConfigService.Current.PickerType, "Box", StringComparison.OrdinalIgnoreCase)
-            ? ColorPickerCalibrationMode.BoxAll
-            : ColorPickerCalibrationMode.Wheel;
+        => DdConfigService.Current.PickerType.Trim().ToLowerInvariant() switch
+        {
+            "box" => ColorPickerCalibrationMode.BoxAll,
+            "hex" => ColorPickerCalibrationMode.HexField,
+            "rgb" => ColorPickerCalibrationMode.Rgb,
+            "hsv" => ColorPickerCalibrationMode.Hsv,
+            _ => ColorPickerCalibrationMode.Wheel
+        };
 
     public void BeginRecreateCurrentColorCalibration()
     {
@@ -338,17 +422,34 @@ public partial class MainWindow : Window
         StartColorPickerCalibration(ColorPickerCalibrationMode.RecreateCurrentColorPoint);
     }
 
+    public void BeginMacroCalibration(bool openPicker)
+    {
+        if (_capturingColorPicker) return;
+        StartColorPickerCalibration(openPicker ? ColorPickerCalibrationMode.OpenPicker : ColorPickerCalibrationMode.ClosePicker);
+    }
+
+    public void BeginBackgroundColorCapture()
+    {
+        if (_capturingColorPicker) return;
+        StartColorPickerCalibration(ColorPickerCalibrationMode.BackgroundColor);
+    }
+
     /// <summary>The click-by-click guidance for each calibration scheme, in capture order.</summary>
     private static string[] CalibrationSteps(ColorPickerCalibrationMode mode)
     {
         if (PickerModeId(mode) is { } pickerId && PickerRegistry.Find(pickerId) is { } definition)
-            return definition.Points
-                .Select(point => LocalizationManager.T(point.PromptKey))
-                .ToArray();
-
-        return new[]
         {
-            CalibText("calib_step_recreate_current", "Click the target application's current-colour indicator (the swatch showing the selected colour).")
+            var keys = CalibrationPointKeys(mode);
+            return definition.Points.Where(point => keys.Contains(point.Key)).Select(point => LocalizationManager.T(point.PromptKey)).ToArray();
+        }
+
+        return mode switch
+        {
+            ColorPickerCalibrationMode.OpenPicker => new[] { CalibText("calib_step_open", "Click the button that opens the target colour picker.") },
+            ColorPickerCalibrationMode.ClosePicker => new[] { CalibText("calib_step_close", "Click the target colour picker's close or confirm button.") },
+            ColorPickerCalibrationMode.BackgroundColor => new[] { CalibText("calib_step_bg", "Click a pixel of the background colour that should be removed.") },
+            ColorPickerCalibrationMode.PaletteCapture => new[] { CalibText("calib_step_palette", "Click a palette swatch. Repeat for every colour, then choose Done or right-click. Esc cancels.") },
+            _ => new[] { CalibText("calib_step_recreate_current", "Click the target application's current-colour indicator (the swatch showing the selected colour).") }
         };
     }
 
@@ -363,16 +464,25 @@ public partial class MainWindow : Window
         _capturingColorPicker = true;
         _calibrationMode = mode;
         _colorPickerCalibrationPoints.Clear();
-        Input.taskHook.MouseClicked += CaptureColorPickerPoint;
+        // Polling physical mouse state is independent of the global hook, so calibration keeps
+        // working when SetWindowsHookEx fails and does not lose clicks that move a few pixels.
+        StopCalibrationClickWatcher();
+        _calibrationClickWatcher = new CalibrationClickWatcher(OnCalibrationClick);
 
         Avalonia.Threading.Dispatcher.UIThread.Invoke(() =>
         {
             _calibrationOverlay = new PickerCalibrationOverlay();
             _calibrationOverlay.CancelRequested += CancelColorPickerCalibration;
+            _calibrationOverlay.DoneRequested += FinishPaletteCapture;
+            _calibrationOverlay.UndoRequested += UndoPaletteCapture;
+            _calibrationOverlay.ShowCompletionActions(mode == ColorPickerCalibrationMode.PaletteCapture);
             _calibrationOverlay.Closed += (_, _) =>
             {
                 _calibrationOverlay = null;
                 InvalidateOverlayBounds();
+                // Closing the guide with its title-bar X does not raise CancelRequested, so the
+                // capture must be released here or every later Calibrate press is ignored.
+                if (_capturingColorPicker) CancelColorPickerCalibration(null, EventArgs.Empty);
             };
             _calibrationOverlay.PositionChanged += (_, _) => CacheOverlayBounds();
             _calibrationOverlay.PropertyChanged += (_, e) =>
@@ -438,17 +548,17 @@ public partial class MainWindow : Window
     }
 
     private static int RequiredCalibrationPoints(ColorPickerCalibrationMode mode)
-        => PickerModeId(mode) is { } pickerId && PickerRegistry.Find(pickerId) is { } definition
-            ? definition.Points.Count
-            : 1;
+        => PickerModeId(mode) is not null ? CalibrationPointKeys(mode).Count : 1;
 
     private void UpdateGuidanceStep(int completed)
     {
         var overlay = _calibrationOverlay;
         if (overlay is null) return;
-        var total = RequiredCalibrationPoints(_calibrationMode);
-        var next = completed >= total ? "..." : CalibrationStepText(completed);
+        var palette = _calibrationMode == ColorPickerCalibrationMode.PaletteCapture;
+        var total = palette ? completed + 1 : RequiredCalibrationPoints(_calibrationMode);
+        var next = !palette && completed >= total ? "..." : CalibrationStepText(Math.Min(completed, CalibrationSteps(_calibrationMode).Length - 1));
         overlay.SetStep(completed, total, next, LocalizationManager.T("calib_title"));
+        if (palette) overlay.ShowCompletionActions(true, completed > 0);
         CacheOverlayBounds();
     }
 
@@ -456,26 +566,46 @@ public partial class MainWindow : Window
     private void CancelColorPickerCalibration(object? sender, EventArgs e)
     {
         if (!_capturingColorPicker) return;
-        Input.taskHook.MouseClicked -= CaptureColorPickerPoint;
         _capturingColorPicker = false;
+        StopCalibrationClickWatcher();
         Avalonia.Threading.Dispatcher.UIThread.Post(() =>
         {
             if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
         });
-        _calibrationOverlay?.Close();
+        var overlay = _calibrationOverlay;
         _calibrationOverlay = null;
+        overlay?.Close();
         Utils.Log("Color picker calibration cancelled.");
     }
 
-    private void CaptureColorPickerPoint(object? sender, MouseHookEventArgs e)
+    /// <summary>Called from the polling watcher thread; marshal before touching capture state.</summary>
+    private void OnCalibrationClick(int x, int y, ClickEdge button)
     {
-        if (e.Data.Button != SharpHook.Native.MouseButton.Button1) return;
-        var clickPoint = new Vector2(e.Data.X, e.Data.Y);
+        Dispatcher.UIThread.Post(() => HandleCalibrationClick(x, y, button));
+    }
+
+    private void StopCalibrationClickWatcher()
+    {
+        _calibrationClickWatcher?.Dispose();
+        _calibrationClickWatcher = null;
+    }
+
+    private void HandleCalibrationClick(int x, int y, ClickEdge button)
+    {
+        if (!_capturingColorPicker) return;
+        var clickPoint = new Vector2(x, y);
         if (IsClickInsideOverlay(clickPoint)) return;
+        if (_calibrationMode == ColorPickerCalibrationMode.PaletteCapture && button == ClickEdge.Right)
+        {
+            FinishPaletteCapture(this, EventArgs.Empty);
+            return;
+        }
+        if (button != ClickEdge.Left) return;
 
         _colorPickerCalibrationPoints.Add(clickPoint);
         var completed = _colorPickerCalibrationPoints.Count;
-        Avalonia.Threading.Dispatcher.UIThread.Post(() => UpdateGuidanceStep(completed));
+        UpdateGuidanceStep(completed);
+        if (_calibrationMode == ColorPickerCalibrationMode.PaletteCapture) return;
 
         var requiredPoints = RequiredCalibrationPoints(_calibrationMode);
         if (_colorPickerCalibrationPoints.Count < requiredPoints) return;
@@ -488,29 +618,103 @@ public partial class MainWindow : Window
         {
             // The capture order is the picker's own declared order, so a new picker definition
             // needs zero changes to this method.
-            var calibration = new PickerCalibration(definition.Id);
-            for (var index = 0; index < definition.Points.Count; index++)
-                calibration.Set(definition.Points[index].Key, ToScreenPoint(points[index]));
+            var keys = CalibrationPointKeys(_calibrationMode);
+            var calibration = IsPartialPickerCalibration(_calibrationMode)
+                ? RecreateOptions.BuildCalibration(DdConfigService.Current, definition.Id)
+                : new PickerCalibration(definition.Id);
+            for (var index = 0; index < keys.Count; index++)
+                calibration.Set(keys[index], ToScreenPoint(points[index]));
 
-            saved = ColorPicker.TrySaveCalibration(calibration, out error);
+            if (IsPartialPickerCalibration(_calibrationMode))
+            {
+                saved = SaveRecreatePoint(config => RecreateOptions.ApplyCalibration(config, calibration), out error);
+            }
+            else saved = ColorPicker.TrySaveCalibration(calibration, out error);
+        }
+        else if (_calibrationMode == ColorPickerCalibrationMode.BackgroundColor)
+        {
+            try
+            {
+                var color = CaptureScreenColor(ToScreenPoint(points[0]));
+                var hex = $"#{color.Red:X2}{color.Green:X2}{color.Blue:X2}";
+                saved = SaveRecreatePoint(config =>
+                {
+                    if (!config.BackgroundColorsToRemove.Contains(hex, StringComparer.OrdinalIgnoreCase))
+                        config.BackgroundColorsToRemove.Add(hex);
+                    config.RemoveBackground = true;
+                }, out error);
+            }
+            catch (Exception ex) { saved = false; error = ex.Message; }
         }
         else
         {
-            SaveRecreatePoint(config => config.RecreateCurrentColorPoint = ToScreenPoint(points[0]));
+            saved = SaveRecreatePoint(config =>
+            {
+                var point = ToScreenPoint(points[0]);
+                switch (_calibrationMode)
+                {
+                    case ColorPickerCalibrationMode.OpenPicker: config.OpenPickerCoordinate = point; break;
+                    case ColorPickerCalibrationMode.ClosePicker: config.ClosePickerCoordinate = point; break;
+                    default: config.RecreateCurrentColorPoint = point; break;
+                }
+            }, out error);
         }
 
         FinishColorPickerCalibration(saved, error);
     }
 
+    private void UndoPaletteCapture(object? sender, EventArgs e)
+    {
+        if (!_capturingColorPicker || _calibrationMode != ColorPickerCalibrationMode.PaletteCapture) return;
+        if (_colorPickerCalibrationPoints.Count > 0)
+            _colorPickerCalibrationPoints.RemoveAt(_colorPickerCalibrationPoints.Count - 1);
+        UpdateGuidanceStep(_colorPickerCalibrationPoints.Count);
+    }
+
+    private void FinishPaletteCapture(object? sender, EventArgs e)
+    {
+        if (!_capturingColorPicker || _calibrationMode != ColorPickerCalibrationMode.PaletteCapture) return;
+        if (_colorPickerCalibrationPoints.Count == 0)
+        {
+            Utils.Log("Palette capture needs at least one swatch.");
+            return;
+        }
+
+        var saved = false;
+        string? error;
+        try
+        {
+            var slots = _colorPickerCalibrationPoints.Select(point =>
+            {
+                var screenPoint = ToScreenPoint(point);
+                var color = CaptureScreenColor(screenPoint);
+                return new PaletteSlot { Coord = screenPoint, Hex = $"#{color.Red:X2}{color.Green:X2}{color.Blue:X2}" };
+            }).ToList();
+            saved = SaveRecreatePoint(config =>
+            {
+                config.PaletteSlots = slots;
+                config.CapturedPalette = slots.Select(slot => slot.Hex).ToList();
+            }, out error);
+        }
+        catch (Exception ex) { error = ex.Message; }
+        FinishColorPickerCalibration(saved, error);
+    }
+
+    private static SKColor CaptureScreenColor(ScreenPoint point)
+        => new GdiScreenColorSampler().TrySample(point)
+           ?? throw new InvalidOperationException("Could not capture the selected screen pixel.");
+
     private static ScreenPoint ToScreenPoint(Vector2 point)
         => new((int)Math.Round(point.X), (int)Math.Round(point.Y));
 
-    private static void SaveRecreatePoint(Action<AutoDrawConfig> update)
+    private static bool SaveRecreatePoint(Action<AutoDrawConfig> update, out string? error)
     {
         var config = DdConfigService.Current;
         update(config);
-        if (!DdConfigService.TryApply(config, out var error))
-            Utils.Log("Recreate calibration rejected: " + error);
+        var saved = DdConfigService.TryApply(config, out var validationError);
+        error = saved ? null : validationError;
+        if (!saved) Utils.Log("Calibration rejected: " + validationError);
+        return saved;
     }
 
     /// <summary>
@@ -520,8 +724,8 @@ public partial class MainWindow : Window
     /// </summary>
     private void FinishColorPickerCalibration(bool saved, string? error)
     {
-        Input.taskHook.MouseClicked -= CaptureColorPickerPoint;
         _capturingColorPicker = false;
+        StopCalibrationClickWatcher();
         Dispatcher.UIThread.Invoke(() =>
         {
             _calibrationOverlay?.Close();
@@ -543,7 +747,11 @@ public partial class MainWindow : Window
             {
                 ColorPickerCalibrationMode.Wheel => LocalizationManager.T("calib_saved_wheel"),
                 ColorPickerCalibrationMode.BoxAll => LocalizationManager.T("calib_saved_box"),
-                _ => LocalizationManager.T("calib_saved_current")
+                ColorPickerCalibrationMode.PaletteCapture => CalibText("calib_saved_palette", "Palette captured. Its colours will now be used for matching and quantization."),
+                ColorPickerCalibrationMode.BackgroundColor => CalibText("calib_saved_bg", "Background colour added to the removal list."),
+                ColorPickerCalibrationMode.OpenPicker or ColorPickerCalibrationMode.ClosePicker => CalibText("calib_saved_macro", "Macro coordinate saved."),
+                ColorPickerCalibrationMode.RecreateCurrentColorPoint => LocalizationManager.T("calib_saved_current"),
+                _ => CalibText("calib_saved_picker", "Colour picker calibration saved.")
             };
             new MessageBox().ShowMessageBox(LocalizationManager.T("calib_saved_title"), message);
         });
@@ -1123,12 +1331,24 @@ public partial class MainWindow : Window
     {
         HandleTextChange(e);
         Drawing.Interval = int.TryParse(DrawIntervalElement.Text, out var interval) ? interval : 10000;
+        if (_inChange || Design.IsDesignMode || !long.TryParse(DrawIntervalElement.Text, out var value)) return;
+        var config = DdConfigService.Current;
+        if (config.Interval == Math.Max(0, value)) return;
+        config.Interval = Math.Max(0, value);
+        config.DrawDelaySeconds = config.Interval / 10_000_000d;
+        if (!DdConfigService.TryApply(config, out var error)) Utils.Log("Interval config write-back rejected: " + error);
     }
 
     private void ClickDelayOnTextChanging(object? sender, TextChangingEventArgs e)
     {
         HandleTextChange(e);
         Drawing.ClickDelay = int.TryParse(ClickDelayElement.Text, out var clickDelay) ? clickDelay : 1000;
+        if (_inChange || Design.IsDesignMode || !int.TryParse(ClickDelayElement.Text, out var milliseconds)) return;
+        var config = DdConfigService.Current;
+        var seconds = Math.Max(0, milliseconds) / 1000d;
+        if (Math.Abs(config.ClickDelay - seconds) < .000001) return;
+        config.ClickDelay = seconds;
+        if (!DdConfigService.TryApply(config, out var error)) Utils.Log("Click-delay config write-back rejected: " + error);
     }
 
     private void minBlackThresholdElementOnTextChanging(object? sender, TextChangingEventArgs e)
@@ -1747,8 +1967,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        using var prepared = ImageProcessing.PrepareColorImage(_preFxBitmap, DdConfigService.Current);
-        PopulateLayers(ImageProcessing.SplitImageByColors(prepared, targetColors, (byte)_alphaThresh, DdConfigService.Current));
+        var config = DdConfigService.Current;
+        using var sized = ImageProcessing.ResizeToCustomDimensions(_preFxBitmap, config);
+        using var prepared = ImageProcessing.PrepareColorImage(sized, config);
+        PopulateLayers(ImageProcessing.SplitImageByColors(prepared, targetColors, (byte)_alphaThresh, config));
     }
 
     public void AutoGenerateLayersButton_OnClick(object? sender, RoutedEventArgs e)
@@ -1766,7 +1988,8 @@ public partial class MainWindow : Window
         }
 
         var config = DdConfigService.Current;
-        using var prepared = ImageProcessing.PrepareColorImage(_preFxBitmap, config);
+        using var sized = ImageProcessing.ResizeToCustomDimensions(_preFxBitmap, config);
+        using var prepared = ImageProcessing.PrepareColorImage(sized, config);
         var targetColors = ImageProcessing.ExtractPalette(prepared, paletteSize, (byte)_alphaThresh, config);
         if (targetColors.Count == 0)
         {
@@ -1933,7 +2156,7 @@ public partial class MainWindow : Window
             var paletteSize = Math.Clamp(config.KClusters, 1, 256);
             List<ColorLayerResult>? layers = null;
             SKBitmap? composite = null;
-            using var source = _preFxBitmap!.Copy();
+            using var source = ImageProcessing.ResizeToCustomDimensions(_preFxBitmap!, config);
             await Task.Run(() =>
             {
                 using var prepared = ImageProcessing.PrepareColorImage(source, config);
@@ -2023,13 +2246,21 @@ public partial class MainWindow : Window
             HexedStatus("status_error_no_area_image");
             return;
         }
-        if (!DdConfigService.Current.AreaSelected)
+
+        var config = DdConfigService.Current;
+        if (config.MaskMode != LayerMaskMode.ColorLayers && !config.AreaSelected)
+        {
+            HexedStatus("status_select_area_f1");
+            return;
+        }
+        // The colour-layer pipeline can run from custom/image dimensions in LxPainter's drag mode;
+        // only "Use Select Area" requires an F1 selection.
+        if (config.MaskMode == LayerMaskMode.ColorLayers && config.LocationMode == 0 && !config.AreaSelected)
         {
             HexedStatus("status_select_area_f1");
             return;
         }
 
-        var config = DdConfigService.Current;
         if (config.MaskMode == LayerMaskMode.ColorLayers)
         {
             await StartColorLayerRecreateAsync(config);
@@ -2107,8 +2338,28 @@ public partial class MainWindow : Window
             return;
         }
 
+        // LxPainter's drag mode gets its origin from the rectangle the user drags at run time.
+        // AutoDraw has no image-drag primitive, so ask for that anchor with the existing F1 overlay
+        // rather than silently drawing from (0, 0).
+        if (config.LocationMode != 0 && !config.AreaSelected)
+        {
+            await SelectDrawAreaAsync();
+            config = DdConfigService.Current;
+            if (!config.AreaSelected) return;
+        }
+
         var options = RecreateOptions.FromConfig(config);
-        options.Canvas = config.DrawRegion;
+        try
+        {
+            options.Canvas = RecreateOptions.ResolveCanvas(config, _preFxBitmap.Width, _preFxBitmap.Height);
+        }
+        catch (InvalidOperationException ex)
+        {
+            HexedStatus(config.LocationMode == 0 && !config.AreaSelected
+                ? "status_select_area_f1"
+                : "status_recreate_error", ex.Message);
+            return;
+        }
         options.DisposeLayers = false;
 
         IInputSimulator input;
@@ -2130,7 +2381,7 @@ public partial class MainWindow : Window
                 if (validation is not null)
                     throw new ColorSelectionException("Color picker is not calibrated: " + validation + ".");
 
-                picker = definition.Create(input, calibration, options, Utils.Log);
+                picker = new MacroColorPicker(definition.Create(input, calibration, options, Utils.Log), input, options);
                 if (options.Verify)
                 {
                     if (options.CurrentColorPoint is null)
@@ -2199,7 +2450,7 @@ public partial class MainWindow : Window
             IFocusGuard? focusGuard = null;
             if (!options.DryRun)
             {
-                Drawing.LastPos = new Vector2(config.DrawRegion.Left, config.DrawRegion.Top);
+                Drawing.LastPos = new Vector2(options.Canvas.Left, options.Canvas.Top);
                 Drawing.ClipToRegion = true;
                 Drawing.ShowPopup = false;
                 Drawing.IsDrawing = true;

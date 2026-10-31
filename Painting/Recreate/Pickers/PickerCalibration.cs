@@ -17,6 +17,14 @@ public static class PickerPoints
     public const string BoxHueEnd = "box.hue_end";
     public const string BoxTopLeft = "box.top_left";
     public const string BoxBottomRight = "box.bottom_right";
+
+    public const string HexField = "hex.field";
+    public const string RgbRed = "rgb.red";
+    public const string RgbGreen = "rgb.green";
+    public const string RgbBlue = "rgb.blue";
+    public const string HsvHue = "hsv.hue";
+    public const string HsvSaturation = "hsv.saturation";
+    public const string HsvValue = "hsv.value";
 }
 
 /// <summary>
@@ -27,12 +35,21 @@ public static class PickerPoints
 public sealed class PickerCalibration
 {
     private readonly Dictionary<string, ScreenPoint> _points = new(StringComparer.OrdinalIgnoreCase);
+    private List<PaletteSlot> _paletteSlots = new();
 
     public PickerCalibration(string pickerType) => PickerType = pickerType ?? string.Empty;
 
     public string PickerType { get; }
 
     public IReadOnlyDictionary<string, ScreenPoint> Points => _points;
+    public IReadOnlyList<PaletteSlot> PaletteSlots => _paletteSlots;
+
+    public PickerCalibration SetPaletteSlots(IEnumerable<PaletteSlot> slots)
+    {
+        ArgumentNullException.ThrowIfNull(slots);
+        _paletteSlots = slots.ToList();
+        return this;
+    }
 
     public PickerCalibration Set(string key, ScreenPoint point)
     {
@@ -63,6 +80,7 @@ public sealed class PickerCalibration
     {
         var clone = new PickerCalibration(PickerType);
         foreach (var pair in _points) clone.Set(pair.Key, pair.Value);
+        clone.SetPaletteSlots(_paletteSlots);
         return clone;
     }
 
@@ -113,8 +131,8 @@ public interface IPickerDefinition
 }
 
 /// <summary>
-/// Registration point for picker definitions.  Exactly the two in-scope pickers are registered;
-/// nothing here knows about the executor, the UI, or persistence.
+/// Registration point for all six picker definitions; nothing here knows about the executor,
+/// the UI, or persistence.
 /// </summary>
 public static class PickerRegistry
 {
@@ -124,8 +142,12 @@ public static class PickerRegistry
 
     static PickerRegistry()
     {
+        Register(new HexPickerDefinition());
+        Register(new RgbPickerDefinition());
+        Register(new HsvPickerDefinition());
         Register(new WheelPickerDefinition());
         Register(new BoxPickerDefinition());
+        Register(new PaletteMatchPickerDefinition());
     }
 
     public static IReadOnlyList<IPickerDefinition> All
@@ -151,7 +173,9 @@ public static class PickerRegistry
     public static IPickerDefinition? Find(string? id)
     {
         if (string.IsNullOrWhiteSpace(id)) return null;
-        lock (Gate) return ById.TryGetValue(id.Trim(), out var definition) ? definition : null;
+        var key = id.Trim().Replace("_", " ");
+        if (key.Replace(" ", string.Empty).Equals("PaletteMatch", StringComparison.OrdinalIgnoreCase)) key = "Palette Match";
+        lock (Gate) return ById.TryGetValue(key, out var definition) ? definition : null;
     }
 
     /// <summary>Resolves a picker or throws a user-facing <see cref="ColorSelectionException"/>.</summary>

@@ -14,8 +14,9 @@ public sealed class SettingsViewModel
         error = string.Empty;
         try
         {
-            var value = JsonConvert.DeserializeObject<AutoDrawConfig>(json);
+            var value = LxPainterConfigMapper.FromLxPainter(Newtonsoft.Json.Linq.JObject.Parse(json));
             if (value is null) { error = "The file contains no configuration."; return false; }
+            DdConfigService.Normalize(value);
             if (!DdConfigService.Validate(value, out error)) return false;
             Draft = value; Json = json; return true;
         }

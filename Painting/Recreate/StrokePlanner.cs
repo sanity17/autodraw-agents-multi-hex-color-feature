@@ -20,8 +20,33 @@ public sealed class StrokePlanOptions
     public int AlphaThreshold { get; set; } = 200;
     public int BrushSize { get; set; } = 1;
     public StrokeOrder Order { get; set; } = StrokeOrder.Serpentine;
+
+    /// <summary>LxPainter stroke traversal.  <see cref="StrokeAlgorithm.Serpentine"/> keeps the
+    /// legacy row-scan order; DFS and Concentric reorder each connected component's runs.</summary>
+    public StrokeAlgorithm Algorithm { get; set; } = StrokeAlgorithm.Serpentine;
+
+    /// <summary>Screen-pixel size of one processed pixel for "Pixel Size Scaling".</summary>
+    public int PixelSize { get; set; } = 1;
+
+    /// <summary>LxPainter drawing method label, retained for logging and diagnostics.</summary>
+    public string DrawMethod { get; set; } = "1:1 Exact (AutoDraw)";
+
+    /// <summary>False uses LxPainter's 8-directional DFS neighbour search.</summary>
+    public bool FourDirectional { get; set; }
+
     public ScreenPoint? Start { get; set; }
 }
+
+public enum StrokeAlgorithm
+{
+    /// <summary>Top-to-bottom rows, alternating direction (the previous engine's behaviour).</summary>
+    Serpentine = 0,
+    /// <summary>LxPainter "DFS (Default)": depth-first traversal of each connected component.</summary>
+    Dfs = 1,
+    /// <summary>LxPainter "Concentric": follow increasing distance from the component edge.</summary>
+    Concentric = 2
+}
+
 
 /// <summary>A single horizontal mouse-down/mouse-up run in screen coordinates.</summary>
 public readonly record struct PlannedStroke(SKPoint Start, SKPoint End)
@@ -43,6 +68,8 @@ public sealed record LayerStrokePlan(SKColor Color, IReadOnlyList<PlannedStroke>
 /// </summary>
 public static class StrokePlanner
 {
+    private readonly record struct Run(int Row, int StartX, int EndX, PlannedStroke Stroke);
+
     public static unsafe List<PlannedStroke> Plan(
         SKBitmap mask,
         CanvasMapper mapper,
@@ -62,6 +89,11 @@ public static class StrokePlanner
         // Account for a downscaled image so a large brush does not repaint the same screen band.
         var rowStep = Math.Max(1, (int)Math.Floor(options.BrushSize / Math.Max(mapper.Scale, 1e-6)));
         var seen = new HashSet<(int, int, int, int)>();
+        var width = mask.Width;
+        var height = mask.Height;
+        var runAt = new int[width * height];
+        Array.Fill(runAt, -1);
+        var opaque = new bool[width * height];
 
         byte* pixelBase = null;
         var fastPixels = mask.BytesPerPixel == 4 && mask.GetPixels() != IntPtr.Zero;
@@ -77,50 +109,370 @@ public static class StrokePlanner
             return alpha > 0 && alpha >= alphaThreshold;
         }
 
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+            opaque[y * width + x] = IsOpaque(x, y);
+
+        // Collect horizontal runs in row order first.  DFS/Concentric then reorder the same runs
+        // instead of inventing a different drawing primitive, so brush/back-end behaviour is
+        // unchanged and only the traversal differs.
+        var rows = new List<List<Run>>();
+        var runIndex = 0;
         var sampledRow = 0;
-        for (var y = 0; y < mask.Height; y += rowStep, sampledRow++)
+        for (var y = 0; y < height; y += rowStep, sampledRow++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var rowStartIndex = result.Count;
+            var rowRuns = new List<Run>();
 
             var runStart = -1;
-            for (var x = 0; x <= mask.Width; x++)
+            for (var x = 0; x <= width; x++)
             {
-                var opaque = x < mask.Width && IsOpaque(x, y);
-                if (opaque && runStart < 0) runStart = x;
-                if (opaque || runStart < 0) continue;
+                var isOpaque = x < width && opaque[y * width + x];
+                if (isOpaque && runStart < 0) runStart = x;
+                if (isOpaque || runStart < 0) continue;
 
                 var runEnd = x - 1;
                 if (runEnd >= runStart)
                 {
                     var (start, end) = mapper.MapRun(y, runStart, runEnd);
                     EnsureLeftToRight(ref start, ref end);
-                    if (sampledRow % 2 == 1)
-                    {
-                        // Reverse both the line and (through the run order below) the row traversal.
-                        (start, end) = (end, start);
-                    }
-
                     var key = Key(start, end);
                     if (seen.Add(key))
                     {
-                        result.Add(new PlannedStroke(
-                            new SKPoint(start.X, start.Y),
-                            new SKPoint(end.X, end.Y)));
+                        var index = runIndex++;
+                        rowRuns.Add(new Run(y, runStart, runEnd,
+                            new PlannedStroke(new SKPoint(start.X, start.Y), new SKPoint(end.X, end.Y))));
+                        for (var runX = runStart; runX <= runEnd; runX++)
+                            runAt[y * width + runX] = index;
                     }
                 }
 
                 runStart = -1;
             }
 
-            if (sampledRow % 2 == 1 && result.Count - rowStartIndex > 1)
-                result.Reverse(rowStartIndex, result.Count - rowStartIndex);
+            rows.Add(rowRuns);
+        }
+
+        var allRuns = rows.SelectMany(row => row).ToList();
+        if (options.Algorithm == StrokeAlgorithm.Serpentine)
+        {
+            for (var row = 0; row < rows.Count; row++)
+            {
+                var rowRuns = rows[row];
+                if (row % 2 == 0)
+                {
+                    foreach (var run in rowRuns) result.Add(run.Stroke);
+                }
+                else
+                {
+                    // Reverse both the line and (through the run order below) the row traversal.
+                    for (var index = rowRuns.Count - 1; index >= 0; index--)
+                        result.Add(rowRuns[index].Stroke.Reverse());
+                }
+            }
+        }
+        else if (allRuns.Count > 0)
+        {
+            var (components, labels) = BuildComponents(runAt, width, height, options.FourDirectional);
+            result = options.Algorithm == StrokeAlgorithm.Concentric
+                ? OrderConcentric(allRuns, runAt, components, labels, opaque, width, height, cancellationToken)
+                : OrderDepthFirst(allRuns, runAt, components, labels, width, height, cancellationToken);
         }
 
         if (options.Order == StrokeOrder.NearestNeighbor && result.Count > 1)
             result = OrderNearest(result, options.Start ?? new ScreenPoint(mapper.Canvas.Left, mapper.Canvas.Top), cancellationToken);
 
         return result;
+    }
+
+    private static readonly (int Dx, int Dy)[] Dirs8 =
+    {
+        (0, -1), (1, 0), (0, 1), (-1, 0), (-1, -1), (1, -1), (1, 1), (-1, 1)
+    };
+
+    private static readonly (int Dx, int Dy)[] Dirs4 =
+    {
+        (0, -1), (1, 0), (0, 1), (-1, 0)
+    };
+
+    private static (List<int[]> Components, int[] Labels) BuildComponents(
+        int[] runAt,
+        int width,
+        int height,
+        bool fourDirectional)
+    {
+        var directions = fourDirectional ? Dirs4 : Dirs8;
+        var labels = new int[runAt.Length];
+        Array.Fill(labels, -1);
+        var components = new List<int[]>();
+        var stack = new Stack<int>();
+
+        for (var index = 0; index < runAt.Length; index++)
+        {
+            if (runAt[index] < 0 || labels[index] >= 0) continue;
+            var component = new List<int>();
+            labels[index] = components.Count;
+            stack.Push(index);
+            while (stack.Count > 0)
+            {
+                var current = stack.Pop();
+                component.Add(current);
+                var x = current % width;
+                var y = current / width;
+                foreach (var (dx, dy) in directions)
+                {
+                    var nx = x + dx;
+                    var ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                    var next = ny * width + nx;
+                    if (runAt[next] < 0 || labels[next] >= 0) continue;
+                    labels[next] = components.Count;
+                    stack.Push(next);
+                }
+            }
+            components.Add(component.ToArray());
+        }
+
+        return (components, labels);
+    }
+
+    /// <summary>
+    /// LxPainter "DFS (Default)": connected components are visited largest first, then each is
+    /// walked depth-first with the reference direction order.  A run is emitted the first time the
+    /// traversal reaches one of its pixels and oriented so it starts on the side that was entered.
+    /// </summary>
+    private static List<PlannedStroke> OrderDepthFirst(
+        List<Run> runs,
+        int[] runAt,
+        List<int[]> components,
+        int[] labels,
+        int width,
+        int height,
+        CancellationToken cancellationToken)
+    {
+        var emitted = new bool[runs.Count];
+        var visited = new bool[runAt.Length];
+        var stack = new Stack<int>();
+        var result = new List<PlannedStroke>(runs.Count);
+
+        foreach (var componentIndex in Enumerable.Range(0, components.Count)
+                     .OrderByDescending(index => components[index].Length))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var start = components[componentIndex][0];
+            visited[start] = true;
+            stack.Push(start);
+
+            while (stack.Count > 0)
+            {
+                var current = stack.Pop();
+                var x = current % width;
+                var y = current / width;
+                var runIndex = runAt[current];
+                if (runIndex >= 0 && !emitted[runIndex])
+                {
+                    emitted[runIndex] = true;
+                    result.Add(OrientByEntry(runs[runIndex], x));
+                }
+
+                foreach (var (dx, dy) in Dirs8)
+                {
+                    var nx = x + dx;
+                    var ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                    var next = ny * width + nx;
+                    if (labels[next] != componentIndex || visited[next]) continue;
+                    visited[next] = true;
+                    stack.Push(next);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// LxPainter "Concentric": walk outward from the component edge following increasing Chebyshev
+    /// depth, penalising direction reversals, then bridge to the cheapest unvisited pixel when no
+    /// adjacent one remains.  Runs are emitted as their first pixel is reached.
+    /// </summary>
+    private static List<PlannedStroke> OrderConcentric(
+        List<Run> runs,
+        int[] runAt,
+        List<int[]> components,
+        int[] labels,
+        bool[] opaque,
+        int width,
+        int height,
+        CancellationToken cancellationToken)
+    {
+        var depths = DistanceTransform(opaque, width, height);
+        var emitted = new bool[runs.Count];
+        var result = new List<PlannedStroke>(runs.Count);
+        var directions = Dirs8;
+
+        foreach (var componentIndex in Enumerable.Range(0, components.Count)
+                     .OrderByDescending(index => components[index].Length))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var unvisited = new HashSet<int>(components[componentIndex]);
+            if (unvisited.Count == 0) continue;
+
+            var start = unvisited
+                .OrderBy(pixel => depths[pixel] == 1 ? 0 : 1)
+                .ThenBy(pixel => pixel / width)
+                .ThenBy(pixel => pixel % width)
+                .First();
+            var current = start;
+            var directionX = 1;
+            var directionY = 0;
+
+            while (true)
+            {
+                unvisited.Remove(current);
+                var runIndex = runAt[current];
+                if (runIndex >= 0 && !emitted[runIndex])
+                {
+                    emitted[runIndex] = true;
+                    result.Add(OrientByEntry(runs[runIndex], current % width));
+                }
+                if (unvisited.Count == 0) break;
+
+                var currentDepth = depths[current];
+                var currentX = current % width;
+                var currentY = current / width;
+                var next = -1;
+                var bestCost = double.MaxValue;
+
+                foreach (var (dx, dy) in directions)
+                {
+                    var nx = currentX + dx;
+                    var ny = currentY + dy;
+                    if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                    var candidate = ny * width + nx;
+                    if (labels[candidate] != componentIndex || !unvisited.Contains(candidate)) continue;
+
+                    var depth = depths[candidate];
+                    var cost = depth > currentDepth ? (depth - currentDepth) * 8d : 0d;
+                    var signX = Math.Sign(dx);
+                    var signY = Math.Sign(dy);
+                    if (signX != 0 && signX == -directionX) cost += 1;
+                    if (signY != 0 && signY == -directionY) cost += 1;
+                    if (cost >= bestCost) continue;
+                    bestCost = cost;
+                    next = candidate;
+                }
+
+                if (next < 0)
+                {
+                    // No neighbour left: bridge to the cheapest unvisited pixel.  Reference uses
+                    // Euclidean distance plus a depth penalty and a smaller axis-aligned cost.
+                    bestCost = double.MaxValue;
+                    foreach (var candidate in unvisited)
+                    {
+                        var cx = candidate % width;
+                        var cy = candidate / width;
+                        var depth = depths[candidate];
+                        var cost = Math.Sqrt(
+                            (cx - currentX) * (cx - currentX) + (cy - currentY) * (cy - currentY));
+                        if (depth > currentDepth) cost += (depth - currentDepth) * 8d;
+                        var dr = cx - currentX;
+                        var dc = cy - currentY;
+                        var signX = Math.Sign(dr);
+                        var signY = Math.Sign(dc);
+                        if (directionX != 0 && signX == -directionX) cost += 1;
+                        cost += Math.Abs(dr) * .5;
+                        if (directionY != 0 && signY == -directionY) cost += 1;
+                        cost += Math.Abs(dc) * .5;
+                        if (cost >= bestCost) continue;
+                        bestCost = cost;
+                        next = candidate;
+                    }
+                }
+
+                if (next < 0) break;
+                var nextX = next % width;
+                var nextY = next / width;
+                var moveX = Math.Sign(nextX - currentX);
+                var moveY = Math.Sign(nextY - currentY);
+                if (moveX != 0 || moveY != 0)
+                {
+                    directionX = moveX;
+                    directionY = moveY;
+                }
+                current = next;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>Chebyshev distance from every opaque pixel to the nearest transparent pixel.</summary>
+    private static int[] DistanceTransform(bool[] opaque, int width, int height)
+    {
+        var depth = new int[opaque.Length];
+        const int far = int.MaxValue / 4;
+        for (var index = 0; index < opaque.Length; index++)
+            depth[index] = opaque[index] ? far : 0;
+
+        // Pixels on the canvas border touch the transparent outside even when the mask runs off the
+        // edge; without this a filled canvas has no depth-1 pixel and "concentric" never starts on
+        // its outer ring.
+        for (var x = 0; x < width; x++)
+        {
+            if (opaque[x]) depth[x] = 1;
+            var bottom = (height - 1) * width + x;
+            if (opaque[bottom]) depth[bottom] = 1;
+        }
+        for (var y = 0; y < height; y++)
+        {
+            var left = y * width;
+            if (opaque[left]) depth[left] = 1;
+            var right = left + width - 1;
+            if (opaque[right]) depth[right] = 1;
+        }
+
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+        {
+            var index = y * width + x;
+            if (depth[index] == 0) continue;
+            var best = depth[index];
+            if (x > 0) best = Math.Min(best, depth[index - 1] + 1);
+            if (y > 0)
+            {
+                best = Math.Min(best, depth[index - width] + 1);
+                if (x > 0) best = Math.Min(best, depth[index - width - 1] + 1);
+                if (x < width - 1) best = Math.Min(best, depth[index - width + 1] + 1);
+            }
+            depth[index] = best;
+        }
+
+        for (var y = height - 1; y >= 0; y--)
+        for (var x = width - 1; x >= 0; x--)
+        {
+            var index = y * width + x;
+            if (depth[index] == 0) continue;
+            var best = depth[index];
+            if (x < width - 1) best = Math.Min(best, depth[index + 1] + 1);
+            if (y < height - 1)
+            {
+                best = Math.Min(best, depth[index + width] + 1);
+                if (x < width - 1) best = Math.Min(best, depth[index + width + 1] + 1);
+                if (x > 0) best = Math.Min(best, depth[index + width - 1] + 1);
+            }
+            depth[index] = best;
+        }
+
+        return depth;
+    }
+
+    /// <summary>Starts the run at the side the traversal entered so consecutive runs stay joined.</summary>
+    private static PlannedStroke OrientByEntry(Run run, int entryX)
+    {
+        var stroke = run.Stroke;
+        var midpoint = (run.StartX + run.EndX) / 2d;
+        return entryX > midpoint ? stroke.Reverse() : stroke;
     }
 
     private static void EnsureLeftToRight(ref ScreenPoint start, ref ScreenPoint end)

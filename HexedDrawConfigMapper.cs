@@ -37,7 +37,14 @@ public static class HexedDrawConfigMapper
     }
 
     public static bool LooksLikeHexedDraw(JObject root)
-        => root["k_clusters"] is not null || root["draw_delay"] is not null || root["color_picking_method"] is not null;
+        => root["circle_params_calib"] is not null ||
+           root["slider_params_calib"] is not null ||
+           root["box_params_calib"] is not null ||
+           root["hue_slider_params_calib"] is not null ||
+           root["palette_rotation_direction_calib"] is not null ||
+           root["draw_order"] is not null ||
+           root["smoothing_level"] is not null ||
+           (root["color_picking_method"] is not null && root["picker_type"] is null);
 
     /// <summary>Loads either a SpeedDraw.json (HexedDrawer) or auto-draw config and applies it.</summary>
     public static bool TryImport(string path, out string error)
@@ -46,7 +53,7 @@ public static class HexedDrawConfigMapper
         {
             var text = File.ReadAllText(path);
             var root = JObject.Parse(text);
-            var config = LooksLikeHexedDraw(root) ? FromHexedDraw(root) : JsonConvert.DeserializeObject<AutoDrawConfig>(text);
+            var config = LooksLikeHexedDraw(root) ? FromHexedDraw(root) : LxPainterConfigMapper.FromLxPainter(root);
             if (config is null)
             {
                 error = "The configuration file could not be parsed.";
@@ -128,12 +135,29 @@ public static class HexedDrawConfigMapper
             ? "Old (No Bridge)" : "New (A* Bridge)";
         var picker = ReadString(root, "picker_type", ReadString(root, "color_picking_method", config.ColorPickingMethod));
         config.ColorPickingMethod = picker.Contains("box", StringComparison.OrdinalIgnoreCase) ? "Box" : "Circle";
-        // Only the wheel and box pickers are implemented; every other imported picker type
-        // becomes the wheel so the imported profile stays editable instead of failing validation.
-        config.PickerType = picker.Contains("box", StringComparison.OrdinalIgnoreCase) ||
-                            config.ColorPickingMethod == "Box"
-            ? "Box"
-            : "Wheel";
+        config.PickerType = picker.Trim().ToLowerInvariant().Replace("_", " ") switch
+        {
+            var value when value.Contains("box", StringComparison.Ordinal) => "Box",
+            var value when value.Contains("rgb", StringComparison.Ordinal) => "RGB",
+            var value when value.Contains("hsv", StringComparison.Ordinal) => "HSV",
+            var value when value.Contains("hex", StringComparison.Ordinal) => "HEX",
+            var value when value.Contains("palette", StringComparison.Ordinal) => "Palette Match",
+            _ => config.ColorPickingMethod == "Box" ? "Box" : "Wheel"
+        };
+
+        if (root["hex_coord"] is JArray hexCoord && hexCoord.Count == 2) config.HexCoordinate = ToPoint(hexCoord);
+        if (root["rgb_coords"] is JArray rgbCoords)
+            config.RgbCoordinates = rgbCoords.Where(point => point is JArray array && array.Count == 2).Select(ToPoint).Take(3).ToList();
+        if (root["hsv_coords"] is JArray hsvCoords)
+            config.HsvCoordinates = hsvCoords.Where(point => point is JArray array && array.Count == 2).Select(ToPoint).Take(3).ToList();
+        if (root["palette_slots"] is JArray slots)
+            config.PaletteSlots = slots.ToObject<List<PaletteSlot>>() ?? new List<PaletteSlot>();
+        if (root["captured_palette"] is JArray)
+        {
+            var lxConfig = LxPainterConfigMapper.FromLxPainter(root);
+            config.CapturedPalette = lxConfig.CapturedPalette;
+            if (config.PaletteSlots.Count == 0) config.PaletteSlots = lxConfig.PaletteSlots;
+        }
 
         config.WheelDirection = ReadString(root, "palette_rotation_direction_calib", config.WheelDirection)
             .Contains("cw", StringComparison.OrdinalIgnoreCase) ? "CW" : "CCW";

@@ -24,6 +24,8 @@
         <TextBlock Name="StepText" TextWrapping="Wrap" FontSize="17">Click the R (red) field</TextBlock>
         <ProgressBar Name="StepProgress" Minimum="0" Maximum="100" Value="0" Height="4"/>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+            <Button Name="UndoButton" Padding="12 4" IsVisible="False">Undo</Button>
+            <Button Name="DoneButton" Padding="12 4" IsVisible="False">Done</Button>
             <Button Name="CancelButton" Padding="12 4">Cancel</Button>
         </StackPanel>
     </StackPanel>

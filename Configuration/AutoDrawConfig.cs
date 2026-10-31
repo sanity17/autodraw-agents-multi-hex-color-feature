@@ -54,6 +54,12 @@ public sealed class AutoDrawConfig
     [JsonProperty("seeds_count")] public int SeedsCount { get; set; } = 8000;
     [JsonProperty("remove_stray")] public bool RemoveStray { get; set; } = true;
     [JsonProperty("picker_type")] public string PickerType { get; set; } = "Wheel";
+    /// <summary>True for LxPainter's Palette Match picker (also accepts the PaletteMatch alias).</summary>
+    [JsonIgnore] public bool IsPaletteMatchPicker =>
+        string.Equals(PickerType?.Replace(" ", string.Empty), "PaletteMatch", StringComparison.OrdinalIgnoreCase);
+    [JsonProperty("hex_coord"), JsonConverter(typeof(NullableScreenPointConverter))] public ScreenPoint? HexCoordinate { get; set; }
+    [JsonProperty("rgb_coords")] public List<ScreenPoint> RgbCoordinates { get; set; } = new();
+    [JsonProperty("hsv_coords")] public List<ScreenPoint> HsvCoordinates { get; set; } = new();
     /// <summary>Name of the active game profile under <c>%LOCALAPPDATA%\AutoDraw\profiles</c>.</summary>
     [JsonProperty("picker_profile")] public string PickerProfile { get; set; } = string.Empty;
     [JsonProperty("wheel_center"), JsonConverter(typeof(NullableScreenPointConverter))] public ScreenPoint? WheelCenter { get; set; }
@@ -74,7 +80,13 @@ public sealed class AutoDrawConfig
     [JsonProperty("delay_close")] public double DelayClose { get; set; } = .01;
     [JsonProperty("open_picker_coord"), JsonConverter(typeof(NullableScreenPointConverter))] public ScreenPoint? OpenPickerCoordinate { get; set; }
     [JsonProperty("close_picker_coord"), JsonConverter(typeof(NullableScreenPointConverter))] public ScreenPoint? ClosePickerCoordinate { get; set; }
-    [JsonProperty("bg_colors_to_remove")] public List<string> BackgroundColorsToRemove { get; set; } = new();
+    [JsonProperty("captured_palette"), JsonConverter(typeof(ColorListConverter))] public List<string> CapturedPalette { get; set; } = new();
+    /// <summary>Captured palette swatches and their screen coordinates, kept parallel to <see cref="CapturedPalette"/>.</summary>
+    [JsonProperty("palette_slots")] public List<PaletteSlot> PaletteSlots { get; set; } = new();
+    [JsonProperty("bg_colors_to_remove"), JsonConverter(typeof(ColorListConverter))] public List<string> BackgroundColorsToRemove { get; set; } = new();
+    [JsonProperty("remove_bg")] public bool RemoveBackground { get; set; } = true;
+    /// <summary>RGB Euclidean background-removal tolerance (0-255). Null keeps the legacy LAB-threshold behaviour.</summary>
+    [JsonProperty("bg_tolerance")] public double? BackgroundTolerance { get; set; }
     [JsonProperty("search_limit")] public int SearchLimit { get; set; } = 20;
     [JsonProperty("safe_search")] public string SafeSearch { get; set; } = "off";
     [JsonProperty("location_mode")] public int LocationMode { get; set; }
@@ -151,6 +163,10 @@ public sealed class LayerMaskModeConverter : JsonConverter<LayerMaskMode>
     }
 }
 
+/// <summary>One captured palette swatch: its screen coordinate and the colour it produces.</summary>
+[JsonConverter(typeof(PaletteSlotConverter))]
+public readonly record struct PaletteSlot(ScreenPoint Coord, string Hex);
+
 [JsonConverter(typeof(ScreenPointConverter))]
 public readonly record struct ScreenPoint(int X, int Y);
 [JsonConverter(typeof(ScreenRectConverter))]
@@ -196,5 +212,64 @@ public sealed class ScreenRectConverter : JsonConverter<ScreenRect>
         var a = JArray.Load(reader);
         if (a.Count != 4 || a.Any(v => v?.Type != JTokenType.Integer)) throw new JsonSerializationException("Draw region must be [left, top, right, bottom].");
         return new ScreenRect(a[0]!.Value<int>(), a[1]!.Value<int>(), a[2]!.Value<int>(), a[3]!.Value<int>());
+    }
+}
+
+/// <summary>Reads #RRGGBB strings as well as LxPainter {hex: ...} and {rgb: [r,g,b]} entries.</summary>
+public sealed class ColorListConverter : JsonConverter<List<string>>
+{
+    public override void WriteJson(JsonWriter writer, List<string> value, JsonSerializer serializer)
+    {
+        writer.WriteStartArray();
+        foreach (var color in value) writer.WriteValue(color);
+        writer.WriteEndArray();
+    }
+
+    public override List<string> ReadJson(JsonReader reader, Type type, List<string> existing, bool hasExisting, JsonSerializer serializer)
+    {
+        if (reader.TokenType == JsonToken.Null) return new List<string>();
+        var result = new List<string>();
+        foreach (var token in JArray.Load(reader))
+        {
+            var value = token.Type == JTokenType.String ? token.Value<string>() : null;
+            if (token is JObject obj)
+            {
+                value = obj["hex"]?.Value<string>() ?? obj["color"]?.Value<string>() ?? obj["colour"]?.Value<string>();
+                if (string.IsNullOrWhiteSpace(value) && obj["rgb"] is JArray rgb) value = FromRgb(rgb);
+            }
+            else if (token is JArray rgbArray) value = FromRgb(rgbArray);
+            if (!string.IsNullOrWhiteSpace(value)) result.Add(value);
+        }
+        return result;
+    }
+
+    private static string FromRgb(JArray rgb)
+        => rgb.Count < 3 ? string.Empty : $"#{Math.Clamp(rgb[0]?.Value<int>() ?? 0, 0, 255):X2}{Math.Clamp(rgb[1]?.Value<int>() ?? 0, 0, 255):X2}{Math.Clamp(rgb[2]?.Value<int>() ?? 0, 0, 255):X2}";
+}
+
+/// <summary>Reads both AutoDraw's {coord, hex} slots and LxPainter's {coord, rgb} entries.</summary>
+public sealed class PaletteSlotConverter : JsonConverter<PaletteSlot>
+{
+    public override void WriteJson(JsonWriter writer, PaletteSlot value, JsonSerializer serializer)
+    {
+        writer.WriteStartObject();
+        writer.WritePropertyName("coord");
+        new JArray(value.Coord.X, value.Coord.Y).WriteTo(writer);
+        writer.WritePropertyName("hex");
+        writer.WriteValue(value.Hex);
+        writer.WriteEndObject();
+    }
+
+    public override PaletteSlot ReadJson(JsonReader reader, Type type, PaletteSlot existing, bool hasExisting, JsonSerializer serializer)
+    {
+        var o = JObject.Load(reader);
+        var coordToken = o["coord"] ?? o["point"] ?? o["xy"];
+        if (coordToken is not JArray a || a.Count != 2 || a[0]?.Type != JTokenType.Integer || a[1]?.Type != JTokenType.Integer)
+            throw new JsonSerializationException("Palette slot coord must be [x, y].");
+
+        var hex = o["hex"]?.Value<string>() ?? o["color"]?.Value<string>() ?? o["colour"]?.Value<string>();
+        if (string.IsNullOrWhiteSpace(hex) && o["rgb"] is JArray rgb && rgb.Count >= 3)
+            hex = $"#{Math.Clamp(rgb[0]?.Value<int>() ?? 0, 0, 255):X2}{Math.Clamp(rgb[1]?.Value<int>() ?? 0, 0, 255):X2}{Math.Clamp(rgb[2]?.Value<int>() ?? 0, 0, 255):X2}";
+        return new PaletteSlot(new ScreenPoint(a[0]!.Value<int>(), a[1]!.Value<int>()), hex ?? string.Empty);
     }
 }

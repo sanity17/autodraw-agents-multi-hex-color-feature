@@ -55,24 +55,39 @@ public static class ImageAnalyzer
         // instance, so clustering and layer masks can never disagree about the space.
         config.ColorDistanceMethod = RecreateOptions.NormalizeColorSpace(options.PaletteColorSpace);
 
-        using var prepared = ImageProcessing.PrepareColorImage(source, config);
+        using var sized = ImageProcessing.ResizeToCustomDimensions(source, config);
+        // Pixel Size Scaling analyses the canvas at one sample per pixel_size screen pixels; the
+        // mapper then expands every processed pixel back to its block on screen.
+        using var drawSized = ImageProcessing.ResizeForDrawMethod(
+            sized,
+            options.Canvas.Width,
+            options.Canvas.Height,
+            options.IsPixelSizeScaling,
+            options.PixelSize);
+        using var prepared = ImageProcessing.PrepareColorImage(drawSized, config);
         cancellationToken.ThrowIfCancellationRequested();
 
+        // LxPainter applies the LAB spatial filter and SEEDS exactly once, then quantizes and
+        // splits the identical pixels.  Re-running preprocessing inside the quantizer would make
+        // the palette and the masks disagree about which colours the pixels have.
+        using var quantizationSource = ImageProcessing.PrepareQuantizationSource(prepared, config);
+
         var palette = Quantizer.ExtractPalette(
-            prepared,
+            quantizationSource,
             options.PaletteSize,
             options.AlphaThreshold,
             config,
-            options.PaletteColorSpace);
+            options.PaletteColorSpace,
+            preprocess: false);
 
         if (palette.Count == 0)
             return new ImageAnalysisResult(prepared.Width, prepared.Height, Array.Empty<SKColor>(), Array.Empty<Layer>());
 
-        SKBitmap splitSource = prepared;
+        SKBitmap splitSource = quantizationSource;
         SKBitmap? grayscale = null;
         if (config.Mode?.Equals("bw", StringComparison.OrdinalIgnoreCase) == true)
         {
-            grayscale = ImageProcessing.ToGrayscale(prepared);
+            grayscale = ImageProcessing.ToGrayscale(quantizationSource);
             splitSource = grayscale;
             palette = palette
                 .Select(color =>
