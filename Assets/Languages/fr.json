@@ -376,5 +376,8 @@
     "draw_pixel_scale":  "Mise à l’échelle par taille de pixel",
     "order_smallest":  "Du plus petit au plus grand",
     "order_random":  "Aléatoire",
+    "hook_failed_title":  "Crochet d'entr\u00e9e global indisponible",
+    "hook_failed_body":  "AutoDraw n'a pas pu d\u00e9marrer les raccourcis globaux. Red\u00e9marrez l'application ou autorisez-la dans votre logiciel de s\u00e9curit\u00e9. Le calibrage du s\u00e9lecteur de couleur fonctionne toujours depuis les boutons.",
+    "status_hook_failed":  "Raccourcis globaux indisponibles ; red\u00e9marrez AutoDraw.",
     "safe_search_strict":  "Strict"
 }

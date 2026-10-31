@@ -376,5 +376,8 @@
     "draw_pixel_scale":  "Pixel Size Scaling",
     "order_smallest":  "Smallest to largest",
     "order_random":  "Random",
+    "hook_failed_title":  "Global Input Hook Unavailable",
+    "hook_failed_body":  "AutoDraw could not start the global hotkeys. Restart the app or allow it in your security software. Color picker calibration still works from its buttons.",
+    "status_hook_failed":  "Global hotkeys unavailable - restart AutoDraw.",
     "safe_search_strict":  "Strict"
 }

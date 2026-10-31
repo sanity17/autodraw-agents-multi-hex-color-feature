@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
 using SharpHook;
@@ -23,7 +24,18 @@ public class Input
     public static Vector2 mousePos;
     public static bool forceUio = false;
     public static event EventHandler? MousePosUpdate;
+
+    /// <summary>Raised once when the global hook cannot be (re)started. Handlers run off the UI thread.</summary>
+    public static event EventHandler<Exception>? HookFailed;
     public static PixelPoint primaryScreenBounds;
+
+    private static bool _mouseHandlersAttached;
+    private static bool _hookStarting;
+    private static int _hookAttempts;
+    private static bool _hookFailureRaised;
+
+    /// <summary>True once SharpHook reports the hook as running.</summary>
+    public static bool IsHookRunning => !taskHook.IsDisposed && taskHook.IsRunning;
 
     //// Functions
 
@@ -37,20 +49,90 @@ public class Input
 
     public static void Start()
     {
-        if (taskHook.IsRunning) return;
         if (taskHook.IsDisposed) return; // Avalonia Preview Fix.
+        if (taskHook.IsRunning || _hookStarting) return;
+
+        _hookStarting = true;
         primaryScreenBounds = MainWindow.CurrentMainWindow.Screens.Primary.Bounds.TopLeft; // updates if main screen orientation changes
 
-        taskHook.MouseMoved += (sender, e) =>
+        if (!_mouseHandlersAttached)
         {
-            mousePos = new Vector2(e.Data.X, e.Data.Y);
-            
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) // || RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
-                mousePos = new Vector2(mousePos.X + primaryScreenBounds.X, mousePos.Y + primaryScreenBounds.Y);
-            MousePosUpdate?.Invoke(null, EventArgs.Empty);
-        };
+            // Subscribe exactly once: retries reuse the same hook instance so every other
+            // KeyPressed/KeyReleased/MouseClicked subscription made by the app stays valid.
+            taskHook.MouseMoved += OnMouseMoved;
+            taskHook.HookEnabled += (_, _) =>
+            {
+                _hookStarting = false;
+                _hookAttempts = 0;
+                _hookFailureRaised = false;
+                Utils.Log("Global input hook started.");
+            };
+            taskHook.HookDisabled += (_, _) => _hookStarting = false;
+            _mouseHandlersAttached = true;
+        }
 
-        taskHook.RunAsync();
+        try
+        {
+            // RunAsync returns a task that faults if the native hook cannot install. It must be
+            // observed here, otherwise the finalizer rethrows it as a crash-style dialog.
+            var hookTask = taskHook.RunAsync();
+            _ = ObserveHookAsync(hookTask);
+        }
+        catch (Exception ex)
+        {
+            _hookStarting = false;
+            HandleHookFailure(ex);
+        }
+    }
+
+    private static void OnMouseMoved(object? sender, MouseHookEventArgs e)
+    {
+        mousePos = new Vector2(e.Data.X, e.Data.Y);
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) // || RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
+            mousePos = new Vector2(mousePos.X + primaryScreenBounds.X, mousePos.Y + primaryScreenBounds.Y);
+        MousePosUpdate?.Invoke(null, EventArgs.Empty);
+    }
+
+    private static async Task ObserveHookAsync(Task hookTask)
+    {
+        try
+        {
+            // Only completes when the hook stops; startup failures surface here as a fault.
+            await hookTask.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _hookStarting = false;
+            HandleHookFailure(ex);
+        }
+    }
+
+    private static void HandleHookFailure(Exception exception)
+    {
+        var actual = exception is AggregateException aggregate ? aggregate.GetBaseException() : exception;
+        Utils.Log("Global input hook failed to start: " + actual);
+
+        // SetWindowsHookEx can fail transiently while the desktop is locked, a security product
+        // is scanning the process, or another input hook is starting. Retry a couple of times on
+        // the same instance before telling the user; all of their event subscriptions survive.
+        if (_hookAttempts < 2)
+        {
+            _hookAttempts++;
+            _ = Task.Delay(750).ContinueWith(_ => Start(), TaskScheduler.Default);
+            return;
+        }
+
+        if (_hookFailureRaised) return;
+        _hookFailureRaised = true;
+        try
+        {
+            HookFailed?.Invoke(null, actual);
+        }
+        catch (Exception ex)
+        {
+            Utils.Log("Global hook failure handler threw: " + ex);
+        }
     }
 
     public static void Stop()

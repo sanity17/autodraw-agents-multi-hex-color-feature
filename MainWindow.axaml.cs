@@ -107,6 +107,7 @@ public partial class MainWindow : Window
     private readonly List<Vector2> _colorPickerCalibrationPoints = new();
     private bool _capturingColorPicker;
     private PickerCalibrationOverlay? _calibrationOverlay;
+    private CalibrationClickWatcher? _calibrationClickWatcher;
     // Screen rect of the guide overlay, cached on the UI thread. The mouse hook runs on
     // a background thread and must never read Avalonia visual properties itself.
     private int _overlayLeft = int.MinValue;
@@ -229,9 +230,33 @@ public partial class MainWindow : Window
         LoadSelectButton.Click += LoadSelectedConfig;
         RefreshConfigList(this, null);
 
-        Input.Start();
         Input.taskHook.KeyReleased += ConfigureColorPicker;
         Input.taskHook.KeyPressed += HexedDrawHotkeys;
+        Input.HookFailed += OnInputHookFailed;
+    }
+
+    /// <summary>
+    /// The global input hook is started after the window is shown so Windows has a live
+    /// interactive desktop and message loop. <see cref="Input.Start"/> retries and reports
+    /// failure instead of leaving a faulted task for the finalizer.
+    /// </summary>
+    protected override void OnOpened(EventArgs e)
+    {
+        base.OnOpened(e);
+        Input.Start();
+    }
+
+    private void OnInputHookFailed(object? sender, Exception exception)
+    {
+        Utils.Log("Global input hook is unavailable: " + exception.Message);
+        Dispatcher.UIThread.Post(() =>
+        {
+            HexedStatus("status_hook_failed");
+            if (IsVisible)
+                new MessageBox().ShowMessageBox(
+                    LocalizationManager.T("hook_failed_title"),
+                    LocalizationManager.T("hook_failed_body"));
+        });
     }
 
     /// <summary>Global HexedDrawer hotkeys: F1 area, F2 start/pause, F3 stop, F4 reset, F6 quantize.</summary>
@@ -439,7 +464,10 @@ public partial class MainWindow : Window
         _capturingColorPicker = true;
         _calibrationMode = mode;
         _colorPickerCalibrationPoints.Clear();
-        Input.taskHook.MouseClicked += CaptureColorPickerPoint;
+        // Polling physical mouse state is independent of the global hook, so calibration keeps
+        // working when SetWindowsHookEx fails and does not lose clicks that move a few pixels.
+        StopCalibrationClickWatcher();
+        _calibrationClickWatcher = new CalibrationClickWatcher(OnCalibrationClick);
 
         Avalonia.Threading.Dispatcher.UIThread.Invoke(() =>
         {
@@ -452,6 +480,9 @@ public partial class MainWindow : Window
             {
                 _calibrationOverlay = null;
                 InvalidateOverlayBounds();
+                // Closing the guide with its title-bar X does not raise CancelRequested, so the
+                // capture must be released here or every later Calibrate press is ignored.
+                if (_capturingColorPicker) CancelColorPickerCalibration(null, EventArgs.Empty);
             };
             _calibrationOverlay.PositionChanged += (_, _) => CacheOverlayBounds();
             _calibrationOverlay.PropertyChanged += (_, e) =>
@@ -535,32 +566,45 @@ public partial class MainWindow : Window
     private void CancelColorPickerCalibration(object? sender, EventArgs e)
     {
         if (!_capturingColorPicker) return;
-        Input.taskHook.MouseClicked -= CaptureColorPickerPoint;
         _capturingColorPicker = false;
+        StopCalibrationClickWatcher();
         Avalonia.Threading.Dispatcher.UIThread.Post(() =>
         {
             if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
         });
-        _calibrationOverlay?.Close();
+        var overlay = _calibrationOverlay;
         _calibrationOverlay = null;
+        overlay?.Close();
         Utils.Log("Color picker calibration cancelled.");
     }
 
-    private void CaptureColorPickerPoint(object? sender, MouseHookEventArgs e)
+    /// <summary>Called from the polling watcher thread; marshal before touching capture state.</summary>
+    private void OnCalibrationClick(int x, int y, ClickEdge button)
+    {
+        Dispatcher.UIThread.Post(() => HandleCalibrationClick(x, y, button));
+    }
+
+    private void StopCalibrationClickWatcher()
+    {
+        _calibrationClickWatcher?.Dispose();
+        _calibrationClickWatcher = null;
+    }
+
+    private void HandleCalibrationClick(int x, int y, ClickEdge button)
     {
         if (!_capturingColorPicker) return;
-        var clickPoint = new Vector2(e.Data.X, e.Data.Y);
+        var clickPoint = new Vector2(x, y);
         if (IsClickInsideOverlay(clickPoint)) return;
-        if (_calibrationMode == ColorPickerCalibrationMode.PaletteCapture && e.Data.Button == SharpHook.Native.MouseButton.Button2)
+        if (_calibrationMode == ColorPickerCalibrationMode.PaletteCapture && button == ClickEdge.Right)
         {
             FinishPaletteCapture(this, EventArgs.Empty);
             return;
         }
-        if (e.Data.Button != SharpHook.Native.MouseButton.Button1) return;
+        if (button != ClickEdge.Left) return;
 
         _colorPickerCalibrationPoints.Add(clickPoint);
         var completed = _colorPickerCalibrationPoints.Count;
-        Avalonia.Threading.Dispatcher.UIThread.Post(() => UpdateGuidanceStep(completed));
+        UpdateGuidanceStep(completed);
         if (_calibrationMode == ColorPickerCalibrationMode.PaletteCapture) return;
 
         var requiredPoints = RequiredCalibrationPoints(_calibrationMode);
@@ -680,8 +724,8 @@ public partial class MainWindow : Window
     /// </summary>
     private void FinishColorPickerCalibration(bool saved, string? error)
     {
-        Input.taskHook.MouseClicked -= CaptureColorPickerPoint;
         _capturingColorPicker = false;
+        StopCalibrationClickWatcher();
         Dispatcher.UIThread.Invoke(() =>
         {
             _calibrationOverlay?.Close();

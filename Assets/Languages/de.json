@@ -376,5 +376,8 @@
     "draw_pixel_scale":  "Skalierung nach Pixelgröße",
     "order_smallest":  "Kleinste zuerst",
     "order_random":  "Zufällig",
+    "hook_failed_title":  "Globaler Eingabe-Hook nicht verf\u00fcgbar",
+    "hook_failed_body":  "AutoDraw konnte die globalen Hotkeys nicht starten. Starten Sie die App neu oder erlauben Sie sie in Ihrer Sicherheitssoftware. Die Farbw\u00e4hler-Kalibrierung funktioniert weiterhin \u00fcber die Schaltfl\u00e4chen.",
+    "status_hook_failed":  "Globale Hotkeys nicht verf\u00fcgbar - bitte AutoDraw neu starten.",
     "safe_search_strict":  "Strict"
 }

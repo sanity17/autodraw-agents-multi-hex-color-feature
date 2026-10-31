@@ -376,5 +376,8 @@
     "draw_pixel_scale":  "Tỷ lệ theo kích thước điểm ảnh",
     "order_smallest":  "Nhỏ đến lớn",
     "order_random":  "Ngẫu nhiên",
+    "hook_failed_title":  "Kh\u00f4ng th\u1ec3 d\u00f9ng hook nh\u1eadp li\u1ec7u to\u00e0n c\u1ee5c",
+    "hook_failed_body":  "AutoDraw kh\u00f4ng th\u1ec3 kh\u1edfi \u0111\u1ed9ng ph\u00edm t\u1eaft to\u00e0n c\u1ee5c. H\u00e3y kh\u1edfi \u0111\u1ed9ng l\u1ea1i \u1ee9ng d\u1ee5ng ho\u1eb7c cho ph\u00e9p n\u00f3 trong ph\u1ea7n m\u1ec1m b\u1ea3o m\u1eadt. Hi\u1ec7u ch\u1ec9nh b\u1ed9 ch\u1ecdn m\u00e0u v\u1eabn ho\u1ea1t \u0111\u1ed9ng t\u1eeb c\u00e1c n\u00fat.",
+    "status_hook_failed":  "Ph\u00edm t\u1eaft to\u00e0n c\u1ee5c kh\u00f4ng kh\u1ea3 d\u1ee5ng; h\u00e3y kh\u1edfi \u0111\u1ed9ng l\u1ea1i AutoDraw.",
     "safe_search_strict":  "Strict"
 }

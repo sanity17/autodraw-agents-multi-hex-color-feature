@@ -376,5 +376,8 @@
     "draw_pixel_scale":  "Escalado por tamaño de píxel",
     "order_smallest":  "De menor a mayor",
     "order_random":  "Aleatorio",
+    "hook_failed_title":  "Hook de entrada global no disponible",
+    "hook_failed_body":  "AutoDraw no pudo iniciar los atajos globales. Reinicia la aplicaci\u00f3n o perm\u00edtela en tu software de seguridad. La calibraci\u00f3n del selector de color sigue funcionando desde los botones.",
+    "status_hook_failed":  "Atajos globales no disponibles; reinicia AutoDraw.",
     "safe_search_strict":  "Strict"
 }
