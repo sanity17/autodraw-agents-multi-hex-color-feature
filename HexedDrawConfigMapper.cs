@@ -128,37 +128,13 @@ public static class HexedDrawConfigMapper
             ? "Old (No Bridge)" : "New (A* Bridge)";
         var picker = ReadString(root, "picker_type", ReadString(root, "color_picking_method", config.ColorPickingMethod));
         config.ColorPickingMethod = picker.Contains("box", StringComparison.OrdinalIgnoreCase) ? "Box" : "Circle";
-        config.PickerType = picker.ToLowerInvariant() switch
-        {
-            var value when value.Contains("box", StringComparison.Ordinal) => "Box",
-            var value when value.Contains("rgb", StringComparison.Ordinal) => "RGB",
-            var value when value.Contains("hsv", StringComparison.Ordinal) => "HSV",
-            var value when value.Contains("hex", StringComparison.Ordinal) => "HEX",
-            var value when value.Contains("palette", StringComparison.Ordinal) => "Palette Match",
-            _ => config.ColorPickingMethod == "Box" ? "Box" : "Wheel"
-        };
+        // Only the wheel and box pickers are implemented; every other imported picker type
+        // becomes the wheel so the imported profile stays editable instead of failing validation.
+        config.PickerType = picker.Contains("box", StringComparison.OrdinalIgnoreCase) ||
+                            config.ColorPickingMethod == "Box"
+            ? "Box"
+            : "Wheel";
 
-        // Field pickers carry their coordinates in the shared dd.json keys, so import them directly.
-        if (root["hex_coord"] is JArray hexCoord && hexCoord.Count == 2) config.HexCoordinate = ToPoint(hexCoord);
-        if (root["rgb_coords"] is JArray rgbCoords)
-            config.RgbCoordinates = rgbCoords.Where(p => p is JArray a && a.Count == 2).Select(ToPoint).Take(3).ToList();
-        if (root["hsv_coords"] is JArray hsvCoords)
-            config.HsvCoordinates = hsvCoords.Where(p => p is JArray a && a.Count == 2).Select(ToPoint).Take(3).ToList();
-        if (root["captured_palette"] is JArray palette && palette.Count > 0)
-        {
-            config.CapturedPalette = palette
-                .Where(p => p is JObject obj && obj["rgb"] is JArray rgbEntry)
-                .Select(p => (JObject)p)
-                .Select(obj =>
-                {
-                    var rgbEntry = (JArray)obj["rgb"]!;
-                    return $"#{Math.Clamp(rgbEntry[0]?.Value<int>() ?? 0, 0, 255):X2}" +
-                           $"{Math.Clamp(rgbEntry[1]?.Value<int>() ?? 0, 0, 255):X2}" +
-                           $"{Math.Clamp(rgbEntry[2]?.Value<int>() ?? 0, 0, 255):X2}";
-                })
-                .Where(hex => hex.Length == 7)
-                .ToList();
-        }
         config.WheelDirection = ReadString(root, "palette_rotation_direction_calib", config.WheelDirection)
             .Contains("cw", StringComparison.OrdinalIgnoreCase) ? "CW" : "CCW";
 
@@ -217,11 +193,7 @@ public static class HexedDrawConfigMapper
                     ? "brightness_to_darkest" : "darkest_to_brightest",
             ["drawer_module"] = config.DrawerModule.Contains("old", StringComparison.OrdinalIgnoreCase) ? "old" : "new",
             ["picker_type"] = config.PickerType,
-            ["color_picking_method"] = config.PickerType.Equals("Box", StringComparison.OrdinalIgnoreCase) ? "box"
-                : config.PickerType.Equals("RGB", StringComparison.OrdinalIgnoreCase) ? "rgb"
-                : config.PickerType.Equals("HSV", StringComparison.OrdinalIgnoreCase) ? "hsv"
-                : config.PickerType.Equals("HEX", StringComparison.OrdinalIgnoreCase) ? "hex"
-                : config.ColorPickingMethod.Contains("box", StringComparison.OrdinalIgnoreCase) ? "box" : "circle",
+            ["color_picking_method"] = config.PickerType.Equals("Box", StringComparison.OrdinalIgnoreCase) ? "box" : "circle",
             ["palette_rotation_direction_calib"] = config.WheelDirection.Equals("CW", StringComparison.OrdinalIgnoreCase) ? "cw" : "ccw",
             ["circle_params_calib"] = new JArray(center.X, center.Y, Math.Round(radius, 3), Math.Round(config.WheelAngle, 3)),
             ["slider_params_calib"] = new JArray(

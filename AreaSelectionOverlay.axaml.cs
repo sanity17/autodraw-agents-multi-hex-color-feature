@@ -4,12 +4,13 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Platform;
 using Autodraw.Configuration;
+using Autodraw.ImageInput;
 
 namespace Autodraw;
 
 public partial class AreaSelectionOverlay : Window
 {
-    private readonly Screen _screen;
+    private readonly MonitorInfo _monitor;
     private Point _start;
     private bool _dragging;
 
@@ -17,8 +18,17 @@ public partial class AreaSelectionOverlay : Window
 
     public AreaSelectionOverlay(Screen screen)
     {
-        _screen = screen;
+        _monitor = new MonitorInfo(
+            0,
+            screen.Bounds.X,
+            screen.Bounds.Y,
+            screen.Bounds.Width,
+            screen.Bounds.Height,
+            screen.Scaling,
+            screen.IsPrimary);
         InitializeComponent();
+        Title = LocalizationManager.T("region_title");
+        Instructions.Text = LocalizationManager.T("region_hint");
         Position = new PixelPoint(screen.Bounds.X, screen.Bounds.Y);
         Width = Math.Max(1, screen.Bounds.Width / screen.Scaling);
         Height = Math.Max(1, screen.Bounds.Height / screen.Scaling);
@@ -62,19 +72,13 @@ public partial class AreaSelectionOverlay : Window
         SelectionBorder.Width = width;
         SelectionBorder.Height = height;
         var rect = ToScreenRect(start, end);
-        SizeText.Text = rect is null ? string.Empty : $"Area: ({rect.Value.Left},{rect.Value.Top}) {rect.Value.Width}x{rect.Value.Height}";
+        SizeText.Text = rect is null
+            ? string.Empty
+            : LocalizationManager.F("region_size", rect.Value.Left, rect.Value.Top, rect.Value.Width, rect.Value.Height);
     }
 
-    private ScreenRect? ToScreenRect(Point start, Point end)
-    {
-        var scale = _screen.Scaling;
-        var x1 = _screen.Bounds.X + (int)Math.Round(Math.Min(start.X, end.X) * scale);
-        var y1 = _screen.Bounds.Y + (int)Math.Round(Math.Min(start.Y, end.Y) * scale);
-        var x2 = _screen.Bounds.X + (int)Math.Round(Math.Max(start.X, end.X) * scale);
-        var y2 = _screen.Bounds.Y + (int)Math.Round(Math.Max(start.Y, end.Y) * scale);
-        var rect = new ScreenRect(x1, y1, Math.Max(x1, x2 - 1), Math.Max(y1, y2 - 1));
-        return rect.Width < 2 || rect.Height < 2 ? null : rect;
-    }
+    private ScreenRect? ToScreenRect(Point start, Point end) =>
+        RegionCaptureMath.FromLogicalDrag(_monitor, start.X, start.Y, end.X, end.Y);
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
     {

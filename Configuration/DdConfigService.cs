@@ -98,12 +98,20 @@ public static class DdConfigService
     public static bool TryLoad(string path, out AutoDrawConfig? config, out string error)
     {
         config = null; error = string.Empty;
-        try { config = JsonConvert.DeserializeObject<AutoDrawConfig>(File.ReadAllText(path), Settings); if (config is null) throw new JsonSerializationException("The file contains no configuration."); return Validate(config, out error); }
+        try
+        {
+            config = JsonConvert.DeserializeObject<AutoDrawConfig>(File.ReadAllText(path), Settings);
+            if (config is null) throw new JsonSerializationException("The file contains no configuration.");
+            // Migrate legacy aliases before validating, otherwise a dd.json written by an older
+            // build (e.g. "picker_type": "hex") fails Validate and the whole file is discarded.
+            Normalize(config);
+            return Validate(config, out error);
+        }
         catch (Exception ex) { error = ex.Message; return false; }
     }
-    public static bool TryApply(AutoDrawConfig candidate, out string error)
+    public static bool TryApply(AutoDrawConfig candidate, out string error, bool allowWhilePaused = false)
     {
-        if (Drawing.IsDrawing) { error = "Stop drawing before applying configuration changes."; return false; }
+        if (Drawing.IsDrawing && !(allowWhilePaused && Drawing.IsPaused)) { error = "Stop drawing before applying configuration changes."; return false; }
         Normalize(candidate);
         if (!Validate(candidate, out error)) return false;
         _current = Clone(candidate); Changed?.Invoke(null, EventArgs.Empty); Persist(); return true;
@@ -118,6 +126,8 @@ public static class DdConfigService
         c.DrawerModule = string.IsNullOrWhiteSpace(c.DrawerModule) ? "New (A* Bridge)" : c.DrawerModule;
         c.DfsMode = string.IsNullOrWhiteSpace(c.DfsMode) ? "8-Directional" : c.DfsMode;
         c.LayerOrder = string.IsNullOrWhiteSpace(c.LayerOrder) ? "Brightness to darkness" : c.LayerOrder;
+        c.RecreateLayerOrder = string.IsNullOrWhiteSpace(c.RecreateLayerOrder) ? "coverage-desc" : c.RecreateLayerOrder.Trim().ToLowerInvariant();
+        c.RecreateStrokeOrder = string.IsNullOrWhiteSpace(c.RecreateStrokeOrder) ? "serpentine" : c.RecreateStrokeOrder.Trim().ToLowerInvariant();
         c.ColorPickingMethod = string.IsNullOrWhiteSpace(c.ColorPickingMethod) ? "Circle" : c.ColorPickingMethod;
         c.PickerType = string.IsNullOrWhiteSpace(c.PickerType) ? "Wheel" : c.PickerType;
         c.RemoveStray = c.RemoveStray || c.StrayRemovalMode.Contains("smart", StringComparison.OrdinalIgnoreCase);
@@ -140,18 +150,33 @@ public static class DdConfigService
         if (c.LayerOrder.Equals("Bright to Dark", StringComparison.OrdinalIgnoreCase)) c.LayerOrder = "Brightness to darkness";
         if (c.LayerOrder.Equals("Largest Area First", StringComparison.OrdinalIgnoreCase)) c.LayerOrder = "Largest area first";
         if (c.LayerOrder.Equals("Dark to Bright", StringComparison.OrdinalIgnoreCase)) c.LayerOrder = "Darkness to brightness";
+        c.RecreateLayerOrder = c.RecreateLayerOrder switch
+        {
+            "largest" or "largest-area-first" or "largest area first" or "coverage" or "coverage-desc"
+                => "coverage-desc",
+            "smallest" or "smallest-area-first" or "coverage-asc" => "coverage-asc",
+            "bright" or "brightness" or "brightness-to-darkness" or "luminance-desc" => "luminance-desc",
+            "dark" or "darkness" or "darkness-to-brightness" or "luminance-asc" => "luminance-asc",
+            _ => c.RecreateLayerOrder
+        };
+        c.RecreateStrokeOrder = c.RecreateStrokeOrder switch
+        {
+            "nearest" or "nearest-neighbor" or "nearest-neighbour" or "nearest neighbour" or "nearest neighbor"
+                => "nearest",
+            _ => "serpentine"
+        };
         if (c.ColorPickingMethod.Equals("Wheel", StringComparison.OrdinalIgnoreCase)) c.ColorPickingMethod = "Circle";
 
-        // An explicit text-field picker (RGB / HSV / HEX / Palette Match) is authoritative and
-        // never gets clobbered back to Wheel/Box by the legacy color_picking_method alias.
-        var isTextPicker = c.IsPaletteMatchPicker
-            || c.PickerType.Equals("RGB", StringComparison.OrdinalIgnoreCase)
-            || c.PickerType.Equals("HEX", StringComparison.OrdinalIgnoreCase)
-            || c.PickerType.Equals("HSV", StringComparison.OrdinalIgnoreCase);
-        if (isTextPicker) c.ColorPickingMethod = "Circle";
-        else if (c.ColorPickingMethod.Equals("Box", StringComparison.OrdinalIgnoreCase)) c.PickerType = "Box";
-        else if (c.PickerType.Equals("Box", StringComparison.OrdinalIgnoreCase)) c.PickerType = "Wheel";
-        if (string.IsNullOrWhiteSpace(c.PickerType)) c.PickerType = c.ColorPickingMethod.Equals("Box", StringComparison.OrdinalIgnoreCase) ? "Box" : "Wheel";
+        // Only the two in-scope pickers are implemented.  Legacy HEX/RGB/HSV/Palette-Match
+        // configurations are migrated to the wheel so an old dd.json still loads and draws.
+        c.PickerType = (c.PickerType ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "box" => "Box",
+            _ => "Wheel"
+        };
+        c.ColorPickingMethod = c.PickerType == "Box" ? "Box" : "Circle";
+        c.WheelDirection = string.Equals(c.WheelDirection, "CW", StringComparison.OrdinalIgnoreCase) ? "CW" : "CCW";
+        c.PickerProfile ??= string.Empty;
     }
     public static void Export(string path) => File.WriteAllText(path, JsonConvert.SerializeObject(_current, Settings));
     public static bool Validate(AutoDrawConfig c, out string error)
@@ -159,12 +184,33 @@ public static class DdConfigService
         error = string.Empty;
         if (c.MonitorIndex < 0 || c.PixelSize < 1 || c.KClusters is < 1 or > 256 || c.Interval < 0 || c.ClickDelay < 0 || c.SeedsCount < 1 || c.BilateralDiameter < 1 || c.LabSpatialIterations < 1 || c.SearchLimit < 1) return Fail("One or more numeric values are outside their valid range.", out error);
         if (c.BrushSize is < 1 or > 64) return Fail("Brush size must be between 1 and 64 pixels.", out error);
+        if (c.RecreateStrokeDelayMs is < 0 or > 60_000) return Fail("Recreate stroke delay must be between 0 and 60000 milliseconds.", out error);
+        if (c.RecreateMoveStepPixels is < 1 or > 512) return Fail("Recreate move step must be between 1 and 512 pixels.", out error);
+        if (!double.IsFinite(c.RecreateVerifyTolerance) || c.RecreateVerifyTolerance is < 0 or > 100)
+            return Fail("Color verification tolerance must be between 0 and 100 ΔE.", out error);
+        if (c.RecreateVerifyRetries is < 0 or > 10) return Fail("Color verification retries must be between 0 and 10.", out error);
+        if (c.RecreateSelectionAttempts is < 1 or > 10) return Fail("Colour selection attempts must be between 1 and 10.", out error);
+        if (c.RecreateStrokeAttempts is < 1 or > 10) return Fail("Stroke attempts must be between 1 and 10.", out error);
+        if (c.RecreateCheckpointEvery is < 1 or > 500) return Fail("Checkpoint interval must be between 1 and 500 strokes.", out error);
+        if (c.RecreateAlphaThreshold is < 0 or > 255) return Fail("Recreate alpha threshold must be between 0 and 255.", out error);
+        if (!new[] { "coverage-desc", "coverage-asc", "luminance-desc", "luminance-asc", "manual",
+                     "largest", "largest-area-first", "largest area first", "coverage",
+                     "smallest", "smallest-area-first",
+                     "bright", "brightness", "brightness-to-darkness", "luminance-desc",
+                     "dark", "darkness", "darkness-to-brightness" }
+                .Contains(c.RecreateLayerOrder ?? string.Empty, StringComparer.OrdinalIgnoreCase))
+            return Fail("Unsupported recreate layer order.", out error);
+        if (!new[] { "serpentine", "nearest", "nearest-neighbor", "nearest-neighbour", "nearest neighbor", "nearest neighbour" }
+                .Contains(c.RecreateStrokeOrder ?? string.Empty, StringComparer.OrdinalIgnoreCase))
+            return Fail("Recreate stroke order must be serpentine or nearest.", out error);
+        if (!Enum.IsDefined(typeof(LayerMaskMode), c.MaskMode))
+            return Fail("Unsupported recreate mode.", out error);
         if (c.DrawDelaySeconds is < 0) return Fail("Draw delay cannot be negative.", out error);
         if (c.StencilOpacity is < 0 or > 100 || c.DelayOpen < 0 || c.DelayInput < 0 || c.DelayClose < 0) return Fail("Opacity must be 0–100 and delays cannot be negative.", out error);
         if (c.LockShape && (c.CustomWidth < 1 || c.CustomHeight < 1)) return Fail("Locked shapes require positive custom dimensions.", out error);
         if (c.DrawRegion.Width < 1 || c.DrawRegion.Height < 1) return Fail("Draw region must have positive width and height.", out error);
         if (!new[] { "DFS (Default)", "Edge Traversal", "Concentric" }.Contains(c.Algorithm)) return Fail("Unsupported drawing algorithm.", out error);
-        if (!new[] { "RGB", "HEX", "HSV", "Wheel", "Box", "Palette Match", "PaletteMatch" }.Contains(c.PickerType, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported picker type.", out error);
+        if (!new[] { "Wheel", "Box" }.Contains(c.PickerType, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported picker type. Supported: Wheel, Box.", out error);
         if (!new[] { "Circle", "Box", "Wheel" }.Contains(c.ColorPickingMethod, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported color picker style.", out error);
         if (!new[] { "color", "bw" }.Contains(c.Mode, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported drawing mode.", out error);
         if (!new[] { "8-Directional", "4-Directional" }.Contains(c.DfsMode, StringComparer.OrdinalIgnoreCase)) return Fail("DFS search must be 8-Directional or 4-Directional.", out error);
@@ -173,11 +219,8 @@ public static class DdConfigService
         if (!SupportedLayerOrders.Contains(c.LayerOrder, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported layer order.", out error);
         if (!new[] { "KMeans++ (Original)", "KMeans (Random)", "MiniBatchKMeans (Fast)", "KMeans++ (Classic)" }.Contains(c.KmeansAlgorithm, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported KMeans method.", out error);
         if (c.ColorDistanceMethod is not null && !new[] { "CIELAB", "RGB", "sRGB", "OKLAB" }.Contains(c.ColorDistanceMethod, StringComparer.OrdinalIgnoreCase)) return Fail("Color space must be CIELAB, RGB/sRGB, or OKLAB.", out error);
-        if (c.IsPaletteMatchPicker && c.PaletteSlots.Count == 0) return Fail("Palette Match requires at least one palette slot (colour + screen coordinate).", out error);
         if (!SupportedQuantizers.Contains(c.QuantizeMethod, StringComparer.OrdinalIgnoreCase)) return Fail($"Unsupported quantize method '{c.QuantizeMethod}'. Supported: {string.Join(", ", SupportedQuantizers)}.", out error);
-        if (c.RgbCoordinates.AnyInvalidCount(0, 3) || c.HsvCoordinates.AnyInvalidCount(0, 3) || c.CapturedPalette.Concat(c.BackgroundColorsToRemove).Concat(c.PaletteSlots.Select(slot => slot.Hex)).Any(x => !System.Text.RegularExpressions.Regex.IsMatch(x ?? "", "^#[0-9A-Fa-f]{6}$"))) return Fail("Palette colors must be #RRGGBB and picker coordinates contain an invalid count.", out error);
         return true;
     }
-    private static bool AnyInvalidCount(this List<ScreenPoint> points, int min, int max) => points.Count != 0 && (points.Count < min || points.Count > max);
     private static bool Fail(string message, out string error) { error = message; return false; }
 }

@@ -17,13 +17,15 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
+using Avalonia.Platform;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
-using Newtonsoft.Json;
 using SharpHook;
 using SharpHook.Native;
 using SkiaSharp;
 using Autodraw.Configuration;
+using Autodraw.ImageInput;
+using Autodraw.Painting.Recreate;
 
 namespace Autodraw;
 
@@ -66,16 +68,27 @@ public partial class MainWindow : Window
     // HexedDrawer integration
     private HexedDrawWindow? _hexedDrawWindow;
     private bool _hexedDrawRunning;
+    private bool _recreateRunning;
+    private CancellationTokenSource? _recreateCts;
+    private RecreatePauseController? _recreatePause;
+    private RecreateEngine? _recreateEngine;
+    private RecreatePreviewWindow? _recreatePreviewWindow;
     private bool _quantizing;
     private int _quantizeGeneration;
     private bool _imageEnhanced;
     private bool _enhanceFailed;
     private bool _hasImportedImage;
+    private bool _capturingRegion;
+    private bool _syncingMonitorList;
+
+    private readonly List<MonitorInfo> _monitors = new();
+    private readonly List<Screen> _monitorScreens = new();
 
     public bool HasImportedImage => _hasImportedImage && _preFxBitmap is { Width: > 1, Height: > 1 };
     public string? ImportedImagePath { get; private set; }
     public Bitmap? QuantizedPreview { get; private set; }
     public bool IsCapturingColorPicker => _capturingColorPicker;
+    public bool IsCapturingRegion => _capturingRegion;
     public event EventHandler? QuantizedPreviewChanged;
     public event EventHandler? QuantizedPreviewInvalidated;
 
@@ -101,19 +114,16 @@ public partial class MainWindow : Window
     private int _overlayRight = int.MinValue;
     private int _overlayBottom = int.MinValue;
 
-    /// <summary>Which calibration scheme the next captured clicks belong to.</summary>
+    /// <summary>
+    /// Which calibration scheme the next captured clicks belong to.  The two picker values map to
+    /// <see cref="PickerRegistry"/> ids; the current-colour indicator is an engine setting, not a
+    /// picker, so it has its own mode.
+    /// </summary>
     private enum ColorPickerCalibrationMode
     {
         Wheel,
-        Slider,
-        Circle,
-        Brightness,
-        BoxHue,
-        Box,
         BoxAll,
-        Rgb,
-        Hsv,
-        HexField
+        RecreateCurrentColorPoint
     }
 
     private ColorPickerCalibrationMode _calibrationMode = ColorPickerCalibrationMode.Wheel;
@@ -160,6 +170,7 @@ public partial class MainWindow : Window
         ColorPickerHelpButton.Click += ShowColorPickerHelp;
         HexedDrawButton.Click += (_, _) => OpenHexedDrawWindow();
         UpdateColorPickerModeStatus();
+        InitializeImageInputUi();
 
         // Base
         Closing += (_, _) => Cleanup();
@@ -215,11 +226,11 @@ public partial class MainWindow : Window
     /// <summary>Global HexedDrawer hotkeys: F1 area, F2 start/pause, F3 stop, F4 reset, F6 quantize.</summary>
     private void HexedDrawHotkeys(object? sender, KeyboardHookEventArgs e)
     {
-        if (_capturingColorPicker) return;
+        if (_capturingColorPicker || _capturingRegion) return;
         switch (e.Data.KeyCode)
         {
             case KeyCode.VcF1:
-                Dispatcher.UIThread.Post(async () => await SelectDrawAreaAsync());
+                Dispatcher.UIThread.Post(async () => await CaptureRegionToImageAsync());
                 break;
             case KeyCode.VcF2:
                 Dispatcher.UIThread.Post(async () => await StartPauseHexedDrawAsync());
@@ -227,7 +238,7 @@ public partial class MainWindow : Window
             case KeyCode.VcF3:
                 Dispatcher.UIThread.Post(() =>
                 {
-                    var wasDrawing = Drawing.IsDrawing || _hexedDrawRunning;
+                    var wasDrawing = Drawing.IsDrawing || _hexedDrawRunning || _recreateRunning;
                     StopHexedDraw();
                     if (!wasDrawing) _hexedDrawWindow?.Close();
                 });
@@ -275,121 +286,77 @@ public partial class MainWindow : Window
         _devwindow?.Close();
         _settings?.Close();
         _aiPrompt?.Close();
+        _recreatePreviewWindow?.Close();
         if (Utils.LogObject != null) Utils.LogObject.Close();
+        _recreateCts?.Cancel();
         Input.Stop();
         Drawing.Halt();
     }
 
-    /// <summary>Listens for the calibration hotkeys on the global hook.
-    ///   F5 -> capture the points the currently selected color picker type needs
-    ///         (Hex: 1, RGB: 3, HSV: 3, Box: 4, Wheel: 4).
-    ///   F7 -> capture six points for the HSV slider picker (min/max of Hue, Saturation, Value).
-    /// Separate part-calibrations for Circle / Brightness / Box hue / Box remain available
-    /// through the capture buttons in the Color Picker settings.
+    /// <summary>
+    /// Listens for the calibration hotkey on the global hook.  F5 calibrates whichever picker is
+    /// selected in <c>dd.json</c>; the guide window derives its steps from that picker's
+    /// <see cref="IPickerDefinition.Points"/>, so a new picker needs no changes here.
     /// </summary>
     private void ConfigureColorPicker(object? sender, KeyboardHookEventArgs e)
     {
         if (_capturingColorPicker) return;
         if (e.Data.KeyCode == KeyCode.VcF5)
-        {
-            var pickerType = DdConfigService.Current.PickerType;
-            var mode = pickerType.ToLowerInvariant() switch
-            {
-                "hex" => ColorPickerCalibrationMode.HexField,
-                "rgb" => ColorPickerCalibrationMode.Rgb,
-                "hsv" => ColorPickerCalibrationMode.Hsv,
-                "box" => ColorPickerCalibrationMode.BoxAll,
-                _ => ColorPickerCalibrationMode.Wheel
-            };
-            StartColorPickerCalibration(mode);
-        }
-        else if (e.Data.KeyCode == KeyCode.VcF7)
-        {
-            StartColorPickerCalibration(ColorPickerCalibrationMode.Slider);
-        }
+            BeginSelectedPickerCalibration();
     }
 
-    /// <summary>Starts a calibration capture programmatically (used by the Color Picker capture buttons).</summary>
-    public void BeginColorPickerCalibration(string mode)
+    /// <summary>Runs the calibration flow for the picker type currently selected in dd.json.
+    /// The Settings tab's Calibrate button and the F5 hotkey both call this method.</summary>
+    public void BeginSelectedPickerCalibration()
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(BeginSelectedPickerCalibration);
+            return;
+        }
+        if (_capturingColorPicker) return;
+        _hexedDrawWindow?.HideForCalibration();
+        StartColorPickerCalibration(SelectedPickerCalibrationMode());
+    }
+
+    /// <summary>Registry id for a picker calibration mode, or null for the current-colour point.</summary>
+    private static string? PickerModeId(ColorPickerCalibrationMode mode) => mode switch
+    {
+        ColorPickerCalibrationMode.Wheel => "Wheel",
+        ColorPickerCalibrationMode.BoxAll => "Box",
+        _ => null
+    };
+
+    private static ColorPickerCalibrationMode SelectedPickerCalibrationMode()
+        => string.Equals(DdConfigService.Current.PickerType, "Box", StringComparison.OrdinalIgnoreCase)
+            ? ColorPickerCalibrationMode.BoxAll
+            : ColorPickerCalibrationMode.Wheel;
+
+    public void BeginRecreateCurrentColorCalibration()
     {
         if (_capturingColorPicker) return;
-        var parsed = mode switch
-        {
-            "Circle" => ColorPickerCalibrationMode.Circle,
-            "Brightness" => ColorPickerCalibrationMode.Brightness,
-            "Slider" => ColorPickerCalibrationMode.Slider,
-            "BoxHue" => ColorPickerCalibrationMode.BoxHue,
-            "Box" => ColorPickerCalibrationMode.Box,
-            "BoxAll" => ColorPickerCalibrationMode.BoxAll,
-            "Rgb" => ColorPickerCalibrationMode.Rgb,
-            "Hsv" => ColorPickerCalibrationMode.Hsv,
-            "Hex" or "HexField" => ColorPickerCalibrationMode.HexField,
-            _ => ColorPickerCalibrationMode.Wheel
-        };
-        StartColorPickerCalibration(parsed);
+        StartColorPickerCalibration(ColorPickerCalibrationMode.RecreateCurrentColorPoint);
     }
 
     /// <summary>The click-by-click guidance for each calibration scheme, in capture order.</summary>
-    private static string[] CalibrationSteps(ColorPickerCalibrationMode mode) => mode switch
+    private static string[] CalibrationSteps(ColorPickerCalibrationMode mode)
     {
-        ColorPickerCalibrationMode.HexField => new[] { LocalizationManager.T("calib_step_hex") },
-        ColorPickerCalibrationMode.Rgb => new[]
+        if (PickerModeId(mode) is { } pickerId && PickerRegistry.Find(pickerId) is { } definition)
+            return definition.Points
+                .Select(point => LocalizationManager.T(point.PromptKey))
+                .ToArray();
+
+        return new[]
         {
-            LocalizationManager.T("calib_step_rgb_r"),
-            LocalizationManager.T("calib_step_rgb_g"),
-            LocalizationManager.T("calib_step_rgb_b")
-        },
-        ColorPickerCalibrationMode.Hsv => new[]
-        {
-            LocalizationManager.T("calib_step_hsv_h"),
-            LocalizationManager.T("calib_step_hsv_s"),
-            LocalizationManager.T("calib_step_hsv_v")
-        },
-        ColorPickerCalibrationMode.Wheel => new[]
-        {
-            LocalizationManager.T("calib_step_wheel_center"),
-            LocalizationManager.T("calib_step_wheel_rim"),
-            LocalizationManager.T("calib_step_wheel_bright"),
-            LocalizationManager.T("calib_step_wheel_dark")
-        },
-        ColorPickerCalibrationMode.BoxAll => new[]
-        {
-            LocalizationManager.T("calib_step_hue_start"),
-            LocalizationManager.T("calib_step_hue_end"),
-            LocalizationManager.T("calib_step_box_tl"),
-            LocalizationManager.T("calib_step_box_br")
-        },
-        ColorPickerCalibrationMode.BoxHue => new[]
-        {
-            LocalizationManager.T("calib_step_hue_start"),
-            LocalizationManager.T("calib_step_hue_end")
-        },
-        ColorPickerCalibrationMode.Box => new[]
-        {
-            LocalizationManager.T("calib_step_box_tl"),
-            LocalizationManager.T("calib_step_box_br")
-        },
-        ColorPickerCalibrationMode.Circle => new[]
-        {
-            LocalizationManager.T("calib_step_wheel_center"),
-            LocalizationManager.T("calib_step_wheel_rim")
-        },
-        ColorPickerCalibrationMode.Brightness => new[]
-        {
-            LocalizationManager.T("calib_step_wheel_dark"),
-            LocalizationManager.T("calib_step_wheel_bright")
-        },
-        ColorPickerCalibrationMode.Slider => new[]
-        {
-            LocalizationManager.T("calib_step_slider_hue_min"),
-            LocalizationManager.T("calib_step_slider_hue_max"),
-            LocalizationManager.T("calib_step_slider_sat_min"),
-            LocalizationManager.T("calib_step_slider_sat_max"),
-            LocalizationManager.T("calib_step_slider_val_min"),
-            LocalizationManager.T("calib_step_slider_val_max")
-        },
-        _ => new[] { string.Empty }
-    };
+            CalibText("calib_step_recreate_current", "Click the target application's current-colour indicator (the swatch showing the selected colour).")
+        };
+    }
+
+    private static string CalibText(string key, string fallback)
+    {
+        var value = LocalizationManager.T(key);
+        return value == key ? fallback : value;
+    }
 
     private void StartColorPickerCalibration(ColorPickerCalibrationMode mode)
     {
@@ -470,16 +437,10 @@ public partial class MainWindow : Window
         _overlayBottom = int.MinValue;
     }
 
-    private static int RequiredCalibrationPoints(ColorPickerCalibrationMode mode) => mode switch
-    {
-        ColorPickerCalibrationMode.Wheel => 4,
-        ColorPickerCalibrationMode.Slider => 6,
-        ColorPickerCalibrationMode.BoxAll => 4,
-        ColorPickerCalibrationMode.Rgb => 3,
-        ColorPickerCalibrationMode.Hsv => 3,
-        ColorPickerCalibrationMode.HexField => 1,
-        _ => 2
-    };
+    private static int RequiredCalibrationPoints(ColorPickerCalibrationMode mode)
+        => PickerModeId(mode) is { } pickerId && PickerRegistry.Find(pickerId) is { } definition
+            ? definition.Points.Count
+            : 1;
 
     private void UpdateGuidanceStep(int completed)
     {
@@ -511,6 +472,7 @@ public partial class MainWindow : Window
         if (e.Data.Button != SharpHook.Native.MouseButton.Button1) return;
         var clickPoint = new Vector2(e.Data.X, e.Data.Y);
         if (IsClickInsideOverlay(clickPoint)) return;
+
         _colorPickerCalibrationPoints.Add(clickPoint);
         var completed = _colorPickerCalibrationPoints.Count;
         Avalonia.Threading.Dispatcher.UIThread.Post(() => UpdateGuidanceStep(completed));
@@ -519,101 +481,85 @@ public partial class MainWindow : Window
         if (_colorPickerCalibrationPoints.Count < requiredPoints) return;
 
         var points = _colorPickerCalibrationPoints.ToArray();
-        switch (_calibrationMode)
+        var saved = true;
+        string? error = null;
+
+        if (PickerModeId(_calibrationMode) is { } pickerId && PickerRegistry.Find(pickerId) is { } definition)
         {
-            case ColorPickerCalibrationMode.Wheel:
-                ColorPicker.SaveWheelCalibration(points[0], points[1], points[2], points[3]);
-                break;
-            case ColorPickerCalibrationMode.Slider:
-                ColorPicker.SaveSliderCalibration(
-                    points[0], points[1], points[2], points[3], points[4], points[5]);
-                break;
-            case ColorPickerCalibrationMode.Circle:
-                ColorPicker.SaveCircleCalibration(points[0], points[1]);
-                break;
-            case ColorPickerCalibrationMode.Brightness:
-                ColorPicker.SaveBrightnessCalibration(points[0], points[1]);
-                break;
-            case ColorPickerCalibrationMode.BoxHue:
-                SaveBoxHueCalibration(points[0], points[1]);
-                break;
-            case ColorPickerCalibrationMode.Box:
-                SaveBoxCalibration(points[0], points[1]);
-                break;
-            case ColorPickerCalibrationMode.BoxAll:
-                ColorPicker.SaveBoxFullCalibration(points[0], points[1], points[2], points[3]);
-                break;
-            case ColorPickerCalibrationMode.Rgb:
-                ColorPicker.SaveRgbCalibration(points[0], points[1], points[2]);
-                break;
-            case ColorPickerCalibrationMode.Hsv:
-                ColorPicker.SaveHsvCalibration(points[0], points[1], points[2]);
-                break;
-            case ColorPickerCalibrationMode.HexField:
-                ColorPicker.SaveHexCalibration(points[0]);
-                break;
+            // The capture order is the picker's own declared order, so a new picker definition
+            // needs zero changes to this method.
+            var calibration = new PickerCalibration(definition.Id);
+            for (var index = 0; index < definition.Points.Count; index++)
+                calibration.Set(definition.Points[index].Key, ToScreenPoint(points[index]));
+
+            saved = ColorPicker.TrySaveCalibration(calibration, out error);
+        }
+        else
+        {
+            SaveRecreatePoint(config => config.RecreateCurrentColorPoint = ToScreenPoint(points[0]));
         }
 
+        FinishColorPickerCalibration(saved, error);
+    }
+
+    private static ScreenPoint ToScreenPoint(Vector2 point)
+        => new((int)Math.Round(point.X), (int)Math.Round(point.Y));
+
+    private static void SaveRecreatePoint(Action<AutoDrawConfig> update)
+    {
+        var config = DdConfigService.Current;
+        update(config);
+        if (!DdConfigService.TryApply(config, out var error))
+            Utils.Log("Recreate calibration rejected: " + error);
+    }
+
+    /// <summary>
+    /// Closes the guide window and reports the result.  A rejected calibration (a collapsed
+    /// wheel, a zero-length hue strip, an off-screen point) keeps the previous one intact and
+    /// tells the user exactly what to re-capture.
+    /// </summary>
+    private void FinishColorPickerCalibration(bool saved, string? error)
+    {
         Input.taskHook.MouseClicked -= CaptureColorPickerPoint;
         _capturingColorPicker = false;
-        Avalonia.Threading.Dispatcher.UIThread.Invoke(() =>
+        Dispatcher.UIThread.Invoke(() =>
         {
             _calibrationOverlay?.Close();
             _calibrationOverlay = null;
             WindowState = WindowState.Normal;
             UpdateColorPickerModeStatus();
+
+            if (!saved)
+            {
+                new MessageBox().ShowMessageBox(
+                    LocalizationManager.T("calib_rejected_title"),
+                    LocalizationManager.F(
+                        "calib_rejected_body",
+                        error ?? LocalizationManager.T("calib_rejected_unknown")));
+                return;
+            }
+
             var message = _calibrationMode switch
             {
-                ColorPickerCalibrationMode.Wheel => "Wheel calibrated. Colors will now be selected on the calibrated wheel.",
-                ColorPickerCalibrationMode.Slider => "Sliders calibrated. Colors will now be driven through the Hue, Saturation, and Value sliders.",
-                ColorPickerCalibrationMode.Circle => "Color circle centre and rim saved.",
-                ColorPickerCalibrationMode.Brightness => "Brightness slider endpoints saved.",
-                ColorPickerCalibrationMode.BoxHue => "Color box hue slider endpoints saved.",
-                ColorPickerCalibrationMode.Box => "Color box corners saved.",
-                ColorPickerCalibrationMode.BoxAll => "Color box calibrated (hue slider + color area).",
-                ColorPickerCalibrationMode.Rgb => "R, G, B fields saved. Layers will now be colored by typing their channels.",
-                ColorPickerCalibrationMode.Hsv => "H, S, V fields saved. Layers will now be colored by typing hue, saturation, and value.",
-                _ => "HEX field saved. Layers will now be colored by typing their hex code."
+                ColorPickerCalibrationMode.Wheel => LocalizationManager.T("calib_saved_wheel"),
+                ColorPickerCalibrationMode.BoxAll => LocalizationManager.T("calib_saved_box"),
+                _ => LocalizationManager.T("calib_saved_current")
             };
-            new MessageBox().ShowMessageBox("Color picker configured", message);
+            new MessageBox().ShowMessageBox(LocalizationManager.T("calib_saved_title"), message);
         });
-    }
-
-    private static void SaveBoxHueCalibration(Vector2 start, Vector2 end)
-    {
-        var config = DdConfigService.Current;
-        config.ColorPickingMethod = "Box";
-        config.PickerType = "Box";
-        config.BoxHueStart = new ScreenPoint((int)start.X, (int)start.Y);
-        config.BoxHueEnd = new ScreenPoint((int)end.X, (int)end.Y);
-        if (!DdConfigService.TryApply(config, out var error)) Utils.Log("Box hue calibration rejected: " + error);
-    }
-
-    private static void SaveBoxCalibration(Vector2 topLeft, Vector2 bottomRight)
-    {
-        var config = DdConfigService.Current;
-        config.ColorPickingMethod = "Box";
-        config.PickerType = "Box";
-        config.BoxTopLeft = new ScreenPoint((int)topLeft.X, (int)topLeft.Y);
-        config.BoxBottomRight = new ScreenPoint((int)bottomRight.X, (int)bottomRight.Y);
-        if (!DdConfigService.TryApply(config, out var error)) Utils.Log("Box calibration rejected: " + error);
     }
 
     private void UpdateColorPickerModeStatus()
     {
         var config = DdConfigService.Current;
-        var pickers = new (string Type, string Fallback)[]
-        {
-            ("hex", "Color Picker: HEX field"),
-            ("rgb", "Color Picker: R, G, B fields"),
-            ("hsv", "Color Picker: H, S, V fields"),
-            ("box", "Color Picker: Color box"),
-            ("wheel", "Color Picker: Color wheel"),
-            ("palette", "Color Picker: Palette match")
-        };
-        var label = pickers.FirstOrDefault(p => (config.PickerType ?? string.Empty).ToLowerInvariant().Contains(p.Type)).Fallback
-            ?? "Color Picker: Color wheel";
-        if (!ColorPicker.ConfiguredTypeIsReady()) label += " (press F5 to set up)";
+        var definition = PickerRegistry.Find(config.PickerType);
+        var label = definition is null
+            ? LocalizationManager.T("picker_status_unknown")
+            : LocalizationManager.F("picker_status", LocalizationManager.T(definition.DisplayNameKey));
+
+        if (!ColorPicker.ConfiguredTypeIsReady())
+            label += " " + LocalizationManager.T("picker_status_needs_setup");
+
         ColorPickerModeLabel.Content = label;
     }
 
@@ -688,6 +634,23 @@ public partial class MainWindow : Window
             BeginMoveDrag(e);
     }
 
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.Key == Key.V && (e.KeyModifiers & KeyModifiers.Control) != 0 && !IsTextInputFocused())
+        {
+            e.Handled = true;
+            _ = PasteImageFromClipboardAsync();
+        }
+
+        base.OnKeyDown(e);
+    }
+
+    private bool IsTextInputFocused()
+    {
+        var focused = TopLevel.GetTopLevel(this)?.FocusManager?.GetFocusedElement();
+        return focused is TextBox;
+    }
+
     // Base UI Handles
 
     private void ProcessButtonOnClick(object? sender, RoutedEventArgs e)
@@ -703,6 +666,106 @@ public partial class MainWindow : Window
 
     public void ImportImage(string? path, byte[]? img = null)
     {
+        if (Drawing.IsDrawing)
+        {
+            ReportImageInputStatus("status_error_drawing_active");
+            return;
+        }
+
+        var decoded = DecodeImage(path, img);
+        if (decoded is null)
+        {
+            ReportImageInputStatus("status_import_failed", Path.GetFileName(path ?? LocalizationManager.T("clipboard_image")));
+            return;
+        }
+
+        ApplySourceBitmap(PrepareSource(decoded), string.IsNullOrWhiteSpace(path) ? null : path);
+    }
+
+    /// <summary>Async import used by picker, clipboard and drop paths. Decoding, normalizing and
+    /// the preview PNG encode all run on the thread pool so large images never stall the UI.</summary>
+    public async Task<bool> ImportImageAsync(string? path, byte[]? img = null, CancellationToken cancellationToken = default)
+    {
+        if (Drawing.IsDrawing)
+        {
+            ReportImageInputStatus("status_error_drawing_active");
+            return false;
+        }
+
+        PreparedSource? prepared;
+        try
+        {
+            prepared = await Task.Run(
+                () => DecodeImage(path, img) is { } decoded ? PrepareSource(decoded) : null,
+                cancellationToken).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Utils.Log("Image preparation failed: " + ex.Message);
+            prepared = null;
+        }
+
+        if (prepared is null)
+        {
+            ReportImageInputStatus("status_import_failed", Path.GetFileName(path ?? LocalizationManager.T("clipboard_image")));
+            return false;
+        }
+
+        ApplySourceBitmap(prepared, string.IsNullOrWhiteSpace(path) ? null : path);
+        return true;
+    }
+
+    private static SKBitmap? DecodeImage(string? path, byte[]? img)
+    {
+        try
+        {
+            if (img is { Length: > 0 }) return SKBitmap.Decode(img);
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
+            using var stream = File.OpenRead(path);
+            return SKBitmap.Decode(stream);
+        }
+        catch (Exception ex)
+        {
+            Utils.Log("Image decode failed: " + ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>Source bitmaps prepared off the UI thread. <see cref="PrepareSource"/> takes
+    /// ownership of the decoded bitmap.</summary>
+    private sealed record PreparedSource(SKBitmap Raw, SKBitmap PreFx, Bitmap Display);
+
+    private static PreparedSource PrepareSource(SKBitmap decoded)
+    {
+        var normalized = decoded.NormalizeColor();
+        if (!ReferenceEquals(normalized, decoded)) decoded.Dispose();
+
+        SKBitmap? preFx = null;
+        Bitmap? display = null;
+        try
+        {
+            preFx = normalized.Copy();
+            display = normalized.ConvertToAvaloniaBitmap();
+            return new PreparedSource(normalized, preFx, display);
+        }
+        catch
+        {
+            preFx?.Dispose();
+            display?.Dispose();
+            normalized.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Replaces the current source image for every input path. The existing image is only
+    /// disposed once the replacement decoded successfully, so a bad paste/drop never blanks the
+    /// preview.</summary>
+    private void ApplySourceBitmap(PreparedSource prepared, string? path)
+    {
         foreach (var layer in LayersContext)
         {
             layer.RawBitmap?.Dispose();
@@ -711,11 +774,11 @@ public partial class MainWindow : Window
         _layersStack.Clear();
 
         _rawBitmap?.Dispose();
-        _rawBitmap = img is null ? SKBitmap.Decode(path).NormalizeColor() : SKBitmap.Decode(img).NormalizeColor();
+        _rawBitmap = prepared.Raw;
         _preFxBitmap?.Dispose();
-        _preFxBitmap = _rawBitmap.Copy();
+        _preFxBitmap = prepared.PreFx;
         _displayedBitmap?.Dispose();
-        _displayedBitmap = _rawBitmap.NormalizeColor().ConvertToAvaloniaBitmap();
+        _displayedBitmap = prepared.Display;
         _processedBitmap?.Dispose();
         _processedBitmap = null;
         ImagePreview.Image = _displayedBitmap;
@@ -740,18 +803,44 @@ public partial class MainWindow : Window
         _inChange = false;
         
         if (widthLock > 0 || heightLock > 0) ResizeImage(_displayedBitmap.Size.Width, _displayedBitmap.Size.Height);
+
+        ReportOversizedImageIfNeeded();
+    }
+
+    /// <summary>Imports never crop. When the selected drawing area is smaller than the image, say
+    /// so and leave scaling to the resize/fit controls.</summary>
+    private void ReportOversizedImageIfNeeded()
+    {
+        if (_rawBitmap is null) return;
+        var config = DdConfigService.Current;
+        if (!config.AreaSelected) return;
+        if (RegionCaptureMath.ExceedsSurface(_rawBitmap.Width, _rawBitmap.Height, config.DrawRegion))
+            ReportImageInputStatus("status_image_larger_than_region");
     }
 
     private async void OpenButtonOnClick(object? sender, RoutedEventArgs e)
     {
+        // Replacing the source bitmaps while the drawing engine still holds them (even paused)
+        // would dispose memory it is about to reuse when the run resumes.
+        if (Drawing.IsDrawing)
+        {
+            ReportImageInputStatus("status_error_drawing_active");
+            return;
+        }
+
         var file = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
-            Title = "Open Image",
+            Title = LocalizationManager.T("btn_select_image"),
             FileTypeFilter = new[] { FilePickerFileTypes.ImageAll },
             AllowMultiple = false
         });
 
-        if (file.Count == 1) ImportImage(file[0].TryGetLocalPath());
+        if (file.Count == 1)
+        {
+            var path = file[0].TryGetLocalPath();
+            if (await ImportImageAsync(path))
+                ReportImageInputStatus("status_import_loaded", Path.GetFileName(path ?? string.Empty));
+        }
     }
 
     private void RunButtonOnClick(object? sender, RoutedEventArgs e)
@@ -1072,43 +1161,349 @@ public partial class MainWindow : Window
         WindowState = WindowState.Minimized;
     }
 
-    public async void PasteControl()
+    private void InitializeImageInputUi()
     {
-        var clipboard = Clipboard;
-        async void writeDump()
+        ImageInputTab.Header = LocalizationManager.T("actions");
+        ActionsHeaderText.Content = LocalizationManager.T("actions");
+        ActionImportButton.Content = LocalizationManager.T("action_import");
+        ActionPasteButton.Content = LocalizationManager.T("action_paste");
+        ActionCaptureButton.Content = LocalizationManager.T("action_capture_region");
+        MonitorSelectLabel.Content = LocalizationManager.T("monitor_select");
+        DropHintText.Text = LocalizationManager.T("drop_hint");
+        DropHighlightText.Text = LocalizationManager.T("drop_hint");
+
+        ActionImportButton.Click += OpenButtonOnClick;
+        ActionPasteButton.Click += PasteImage_OnClick;
+        ActionCaptureButton.Click += async (_, _) => await CaptureRegionToImageAsync();
+        MonitorCombo.SelectionChanged += MonitorCombo_OnSelectionChanged;
+
+        DragDrop.SetAllowDrop(this, true);
+        AddHandler(DragDrop.DragEnterEvent, OnImageDragOver);
+        AddHandler(DragDrop.DragOverEvent, OnImageDragOver);
+        AddHandler(DragDrop.DragLeaveEvent, OnImageDragLeave);
+        AddHandler(DragDrop.DropEvent, OnImageDrop);
+
+        Screens.Changed += (_, _) => Dispatcher.UIThread.Post(RefreshMonitorList);
+        RefreshMonitorList();
+        ReportImageInputStatus("ready");
+    }
+
+    // ---------------------------------------------------------------- image input actions
+
+    private async void PasteImage_OnClick(object? sender, RoutedEventArgs e) => await PasteImageFromClipboardAsync();
+
+    /// <summary>Ctrl+V / Paste menu entry. Accepts a clipboard file reference or raw clipboard
+    /// pixels; failures are reported through the non-modal status label instead of a dialog.</summary>
+    public async Task PasteImageFromClipboardAsync()
+    {
+        if (Drawing.IsDrawing)
         {
-            string dump = JsonConvert.SerializeObject(await clipboard.GetFormatsAsync(), Formatting.Indented);
-            Utils.Log(dump);
-            dump = JsonConvert.SerializeObject(await clipboard.GetTextAsync(), Formatting.Indented);
-            Utils.Log(dump);
-            dump = JsonConvert.SerializeObject(await clipboard.GetDataAsync(DataFormats.FileNames), Formatting.Indented);
-            Utils.Log(dump);
-            dump = JsonConvert.SerializeObject(await clipboard.GetDataAsync(DataFormats.Text), Formatting.Indented);
-            Utils.Log(dump);
+            ReportImageInputStatus("status_error_drawing_active");
+            return;
         }
+
+        var payload = await ClipboardImageReader.ReadAsync(Clipboard);
+        await ImportPayloadAsync(payload, fromClipboard: true);
+    }
+
+    private async Task<bool> ImportPayloadAsync(ClipboardPayload payload, bool fromClipboard)
+    {
+        switch (payload.Kind)
+        {
+            case ClipboardPayloadKind.FileReference:
+                if (!ClipboardPayloadClassifier.IsDroppableFile(payload.Path))
+                {
+                    ReportImageInputStatus(fromClipboard ? "status_clipboard_no_image_file" : "status_drop_invalid");
+                    return false;
+                }
+                if (!await ImportImageAsync(payload.Path)) return false;
+                ReportImageInputStatus(fromClipboard ? "status_pasted_image" : "status_import_loaded", Path.GetFileName(payload.Path));
+                return true;
+
+            case ClipboardPayloadKind.EncodedImage:
+                if (!await ImportImageAsync(null, payload.EncodedBytes)) return false;
+                ReportImageInputStatus(fromClipboard ? "status_pasted_image" : "status_import_loaded", LocalizationManager.T("clipboard_image"));
+                return true;
+
+            default:
+                ReportImageInputStatus(fromClipboard ? "status_clipboard_no_image" : "status_drop_invalid");
+                return false;
+        }
+    }
+
+    private void OnImageDragOver(object? sender, DragEventArgs e)
+    {
+        var valid = HasDroppableImage(e.Data);
+        e.DragEffects = valid ? DragDropEffects.Copy : DragDropEffects.None;
+        DropHighlight.IsVisible = valid;
+        e.Handled = true;
+    }
+
+    private void OnImageDragLeave(object? sender, DragEventArgs e)
+    {
+        DropHighlight.IsVisible = false;
+        e.Handled = true;
+    }
+
+    private async void OnImageDrop(object? sender, DragEventArgs e)
+    {
+        DropHighlight.IsVisible = false;
+        e.Handled = true;
+
+        if (Drawing.IsDrawing)
+        {
+            ReportImageInputStatus("status_error_drawing_active");
+            return;
+        }
+
+        // Read everything before awaiting: drop data becomes invalid once this handler returns.
+        var payload = ReadDropPayload(e.Data);
+        await ImportPayloadAsync(payload, fromClipboard: false);
+    }
+
+    private static bool HasDroppableImage(IDataObject data)
+    {
+        if (data.Contains("PNG") || data.Contains("image/png") || data.Contains("Bitmap")) return true;
+        return FirstSupportedDropPath(data) is not null;
+    }
+
+    private static string? FirstSupportedDropPath(IDataObject data)
+    {
+        var files = data.GetFiles();
+        if (files is not null)
+        {
+            foreach (var file in files)
+            {
+                var path = file.TryGetLocalPath();
+                if (ClipboardPayloadClassifier.IsDroppableFile(path)) return path;
+            }
+        }
+
+        var names = GetFileNamesCompat(data);
+        if (names is not null)
+        {
+            foreach (var name in names)
+                if (ClipboardPayloadClassifier.IsDroppableFile(name)) return name;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string>? GetFileNamesCompat(IDataObject data)
+    {
+        // FileNames is desktop-only and deprecated in Avalonia 11, but some drag sources only
+        // expose it. GetFiles is preferred above.
+#pragma warning disable CS0618
+        return data.GetFileNames();
+#pragma warning restore CS0618
+    }
+
+    private static ClipboardPayload ReadDropPayload(IDataObject data)
+    {
+        var path = FirstSupportedDropPath(data);
+        if (path is not null) return ClipboardPayload.FromFile(path);
+
+        foreach (var format in new[] { "PNG", "image/png", "Bitmap" })
+        {
+            var bytes = ClipboardImageReader.TryExtractEncodedBytes(data.Get(format));
+            if (bytes is { Length: > 0 }) return ClipboardPayload.FromBytes(bytes);
+        }
+
+        return ClipboardPayload.None;
+    }
+
+    /// <summary>F1 region capture: dim the selected monitor, drag a rectangle, store it as
+    /// <c>draw_region</c>, and use the captured pixels as the source image. Esc and zero-area
+    /// drags leave the previous image untouched.</summary>
+    public async Task CaptureRegionToImageAsync()
+    {
+        if (_capturingRegion || _capturingColorPicker) return;
+        if (Drawing.IsDrawing && !Drawing.IsPaused)
+        {
+            ReportImageInputStatus("status_error_drawing_active");
+            return;
+        }
+
+        _capturingRegion = true;
         try
         {
-            var file = await clipboard.GetDataAsync(DataFormats.Files) as IEnumerable<IStorageItem>;
-            var img = await clipboard.GetDataAsync("PNG");
-            string d = JsonConvert.SerializeObject(await clipboard.GetFormatsAsync(), Formatting.Indented);
-            Utils.Log(d);
-            if (file is not null) {ImportImage(file.First().Path.LocalPath);}
-            else if (img is not null) {ImportImage("",(byte[]?)img);}
-            else
+            RefreshMonitorList();
+            var config = DdConfigService.Current;
+            var monitor = MonitorCatalog.Resolve(_monitors, config.MonitorIndex, out var fellBack);
+            if (monitor is null)
             {
-                new MessageBox().ShowMessageBox("Error!", "Invalid Image to Paste!", "error");
-                Utils.Log("Error with PasteControl(): No image found in clipboard! Dumping clipboard.");
-                writeDump();
+                ReportImageInputStatus("monitor_none");
+                return;
             }
-            
+
+            if (fellBack)
+            {
+                config.MonitorIndex = monitor.Value.Index;
+                if (!DdConfigService.TryApply(config, out var fallbackError, allowWhilePaused: true))
+                    Utils.Log("Monitor fallback could not be saved: " + fallbackError);
+                ReportImageInputStatus("status_monitor_missing", monitor.Value.Index);
+            }
+
+            if (monitor.Value.Index < 0 || monitor.Value.Index >= _monitorScreens.Count)
+            {
+                ReportImageInputStatus("monitor_none");
+                return;
+            }
+
+            var screen = _monitorScreens[monitor.Value.Index];
+            var rect = await AreaSelector.SelectAsync(this, screen);
+            if (rect is null)
+            {
+                ReportImageInputStatus("status_area_selection_cancel");
+                return;
+            }
+
+            if (!RegionCaptureMath.IsRegionInside(rect.Value, monitor.Value))
+            {
+                ReportImageInputStatus("status_region_failed");
+                return;
+            }
+
+            if (!ApplyCapturedRegion(rect.Value, monitor.Value.Index)) return;
+
+            // Replacing the layer bitmaps while the drawing engine still holds them would crash
+            // the paused run, so a paused capture only updates the region.
+            if (Drawing.IsDrawing)
+            {
+                ReportImageInputStatus("status_region_not_replaced");
+                return;
+            }
+
+            var prepared = await Task.Run(() =>
+                ScreenCapture.Capture(rect.Value) is { } capture ? PrepareSource(capture) : null);
+            if (prepared is null)
+            {
+                ReportImageInputStatus("status_region_failed");
+                return;
+            }
+
+            ApplySourceBitmap(prepared, null);
+            ReportImageInputStatus("status_region_captured", rect.Value.Left, rect.Value.Top, rect.Value.Width, rect.Value.Height);
         }
         catch (Exception ex)
         {
-            new MessageBox().ShowMessageBox("Error!", "Invalid Image to Paste!", "error");
-            Utils.Log("Error with PasteControl(): " + ex);
-            writeDump();
+            Utils.Log("Region capture failed: " + ex);
+            ReportImageInputStatus("status_region_failed");
+        }
+        finally
+        {
+            _capturingRegion = false;
         }
     }
+
+    private bool ApplyCapturedRegion(ScreenRect region, int monitorIndex)
+    {
+        var config = DdConfigService.Current;
+        config.DrawRegion = region;
+        config.MonitorIndex = monitorIndex;
+        config.AreaSelected = true;
+        if (!DdConfigService.TryApply(config, out var error, allowWhilePaused: true))
+        {
+            ReportImageInputStatus("status_area_error", error);
+            return false;
+        }
+
+        Drawing.LastPos = new Vector2(region.Left, region.Top);
+        Drawing.ClipToRegion = true;
+        return true;
+    }
+
+    private void RefreshMonitorList()
+    {
+        var previous = DdConfigService.Current.MonitorIndex;
+        var pairs = Screens.All
+            .Select(screen => (Screen: screen, Info: new MonitorInfo(
+                0,
+                screen.Bounds.X,
+                screen.Bounds.Y,
+                screen.Bounds.Width,
+                screen.Bounds.Height,
+                screen.Scaling,
+                screen.IsPrimary)))
+            .ToList();
+
+        var ordered = MonitorCatalog.Order(pairs.Select(pair => pair.Info));
+        _monitors.Clear();
+        _monitorScreens.Clear();
+        foreach (var info in ordered)
+        {
+            var match = pairs.FirstOrDefault(pair =>
+                pair.Info.Left == info.Left && pair.Info.Top == info.Top &&
+                pair.Info.Width == info.Width && pair.Info.Height == info.Height);
+            if (match.Screen is null) continue;
+            _monitors.Add(info);
+            _monitorScreens.Add(match.Screen);
+        }
+
+        _syncingMonitorList = true;
+        MonitorCombo.ItemsSource = _monitors.Select(FormatMonitorLabel).ToList();
+        var resolved = MonitorCatalog.Resolve(_monitors, previous, out _);
+        MonitorCombo.SelectedIndex = resolved?.Index ?? -1;
+        _syncingMonitorList = false;
+    }
+
+    private static string FormatMonitorLabel(MonitorInfo monitor) =>
+        LocalizationManager.F(
+            "monitor_label",
+            monitor.Index,
+            monitor.Width,
+            monitor.Height,
+            Math.Round(monitor.Scaling * 100));
+
+    private void SyncMonitorSelection(int monitorIndex)
+    {
+        if (_monitors.Count == 0) return;
+        var resolved = MonitorCatalog.Resolve(_monitors, monitorIndex, out _);
+        _syncingMonitorList = true;
+        MonitorCombo.SelectedIndex = resolved?.Index ?? -1;
+        _syncingMonitorList = false;
+    }
+
+    private void MonitorCombo_OnSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (_syncingMonitorList || _inChange || Design.IsDesignMode) return;
+        var index = MonitorCombo.SelectedIndex;
+        if (index < 0 || index >= _monitors.Count) return;
+
+        var config = DdConfigService.Current;
+        if (config.MonitorIndex == index) return;
+        config.MonitorIndex = index;
+        if (!DdConfigService.TryApply(config, out var error))
+        {
+            SyncMonitorSelection(config.MonitorIndex);
+            ReportImageInputStatus("status_error_drawing_active");
+            Utils.Log("Monitor change rejected: " + error);
+            return;
+        }
+
+        var monitor = _monitors[index];
+        ReportImageInputStatus("status_monitor_selected", index, monitor.Width, monitor.Height);
+    }
+
+    /// <summary>Single place that pushes image-input feedback to the Actions panel (and the
+    /// HexedDrawer status bar when it is open) so every input path is localized and non-fatal.</summary>
+    private void ReportImageInputStatus(string key, params object?[] args)
+    {
+        var text = args.Length == 0 ? LocalizationManager.T(key) : LocalizationManager.F(key, args);
+        Utils.Log(text);
+
+        void Apply()
+        {
+            ImageInputStatusText.Text = text;
+            _hexedDrawWindow?.SetStatus(text);
+        }
+
+        if (Dispatcher.UIThread.CheckAccess()) Apply();
+        else Dispatcher.UIThread.Post(Apply);
+    }
+
+    // Legacy entry point kept for the Automation menu / external callers.
+    public async void PasteControl() => await PasteImageFromClipboardAsync();
 
     public async void SetConfigFolderViaDialog(object? sender, RoutedEventArgs e)
     {
@@ -1224,8 +1619,8 @@ public partial class MainWindow : Window
         PaletteSizeInput.Text = config.KClusters.ToString(CultureInfo.InvariantCulture);
         _inChange = false;
         if (config.LockShape) { widthLock = config.CustomWidth; heightLock = config.CustomHeight; WidthInput.Text = config.CustomWidth.ToString(); HeightInput.Text = config.CustomHeight.ToString(); }
-        if (config.CapturedPalette.Count > 0) HexColorsInput.Text = string.Join(", ", config.CapturedPalette);
         Drawing.LastPos = new Vector2(config.DrawRegion.Left, config.DrawRegion.Top);
+        SyncMonitorSelection(config.MonitorIndex);
         UpdateColorPickerModeStatus();
     }
 
@@ -1372,9 +1767,7 @@ public partial class MainWindow : Window
 
         var config = DdConfigService.Current;
         using var prepared = ImageProcessing.PrepareColorImage(_preFxBitmap, config);
-        var targetColors = config.CapturedPalette.Count > 0
-            ? config.CapturedPalette.Select(SKColor.Parse).ToList()
-            : ImageProcessing.ExtractPalette(prepared, paletteSize, (byte)_alphaThresh, config);
+        var targetColors = ImageProcessing.ExtractPalette(prepared, paletteSize, (byte)_alphaThresh, config);
         if (targetColors.Count == 0)
         {
             new MessageBox().ShowMessageBox("Warning", "No opaque pixels were found in the image.", "warning");
@@ -1544,9 +1937,7 @@ public partial class MainWindow : Window
             await Task.Run(() =>
             {
                 using var prepared = ImageProcessing.PrepareColorImage(source, config);
-                var colors = config.CapturedPalette.Count > 0
-                    ? config.CapturedPalette.Select(SKColor.Parse).ToList()
-                    : ImageProcessing.ExtractPalette(prepared, paletteSize, (byte)_alphaThresh, config);
+                var colors = ImageProcessing.ExtractPalette(prepared, paletteSize, (byte)_alphaThresh, config);
                 if (colors.Count == 0) throw new InvalidOperationException(LocalizationManager.T("status_image_transparent"));
 
                 if (config.Mode.Equals("bw", StringComparison.OrdinalIgnoreCase))
@@ -1602,6 +1993,16 @@ public partial class MainWindow : Window
 
     public async Task StartPauseHexedDrawAsync()
     {
+        if (_recreateRunning)
+        {
+            if (_recreatePause is { } pause)
+            {
+                pause.IsPaused = !pause.IsPaused;
+                Drawing.IsPaused = pause.IsPaused;
+            }
+            HexedStatus(Drawing.IsPaused ? "status_paused" : "status_drawing");
+            return;
+        }
         if (_hexedDrawRunning)
         {
             if (Drawing.IsDrawing)
@@ -1628,6 +2029,13 @@ public partial class MainWindow : Window
             return;
         }
 
+        var config = DdConfigService.Current;
+        if (config.MaskMode == LayerMaskMode.ColorLayers)
+        {
+            await StartColorLayerRecreateAsync(config);
+            return;
+        }
+
         if (LayersContext.Count == 0) await QuantizeForHexedDrawAsync();
         if (LayersContext.Count == 0) return;
 
@@ -1644,7 +2052,6 @@ public partial class MainWindow : Window
         }
         if (_layersStack.Count == 0) return;
 
-        var config = DdConfigService.Current;
         var region = config.DrawRegion;
         var origin = new Vector2(region.Left, region.Top);
         Drawing.LastPos = origin;
@@ -1686,8 +2093,254 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Colour-layer workflow: analyse the imported image, build one mask per palette colour, then
+    /// run the cancellable stroke engine.  Authentication/calibration errors are reported before
+    /// the mouse is touched.  All masks are owned by <see cref="ImageAnalysisResult"/> and released
+    /// in the finally block; the engine is told not to dispose them a second time.
+    /// </summary>
+    private async Task StartColorLayerRecreateAsync(AutoDrawConfig config)
+    {
+        if (_preFxBitmap is not { Width: > 1, Height: > 1 })
+        {
+            HexedStatus("status_error_no_area_image");
+            return;
+        }
+
+        var options = RecreateOptions.FromConfig(config);
+        options.Canvas = config.DrawRegion;
+        options.DisposeLayers = false;
+
+        IInputSimulator input;
+        IColorPicker picker;
+        IColorVerifier? verifier = null;
+        try
+        {
+            input = InputSimulatorFactory.Create();
+            if (options.DryRun)
+            {
+                // A preview must not require a calibrated picker; it never clicks the target app.
+                picker = new NoOpColorPicker();
+            }
+            else
+            {
+                var definition = PickerRegistry.Require(options.PickerType);
+                var calibration = RecreateOptions.BuildCalibration(config, definition.Id);
+                var validation = definition.Validate(calibration, ScreenGeometry.TryGetVirtualScreenBounds());
+                if (validation is not null)
+                    throw new ColorSelectionException("Color picker is not calibrated: " + validation + ".");
+
+                picker = definition.Create(input, calibration, options, Utils.Log);
+                if (options.Verify)
+                {
+                    if (options.CurrentColorPoint is null)
+                        throw new ColorSelectionException(LocalizationManager.T("status_recreate_verify_missing"));
+                    verifier = new ColorVerifier(new GdiScreenColorSampler(), options.CurrentColorPoint.Value, options.VerifyTolerance);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            HexedStatus("status_recreate_error", ex.Message);
+            return;
+        }
+
+        var hexedWasVisible = _hexedDrawWindow is { IsVisible: true };
+        var showPopup = Drawing.ShowPopup;
+        _recreateCts = new CancellationTokenSource();
+        var token = _recreateCts.Token;
+        _recreatePause = new RecreatePauseController();
+        _recreateRunning = true;
+        if (!options.DryRun)
+        {
+            // Reserve the shared drawing state during analysis too, so the legacy Run button
+            // cannot start a second engine against the same imported bitmap.
+            Drawing.IsDrawing = true;
+            Drawing.IsPaused = false;
+            Drawing.ResetProgress();
+        }
+        var minimized = false;
+        ImageAnalysisResult? analysis = null;
+
+        try
+        {
+            HexedStatus("status_recreate_analyzing");
+            using (var source = _preFxBitmap!.Copy())
+            {
+                analysis = await Task.Run(
+                    () => ImageAnalyzer.Analyze(source, options, config, token),
+                    token);
+            }
+
+            if (analysis.Layers.Count == 0)
+            {
+                HexedStatus("status_image_transparent");
+                return;
+            }
+            HexedStatus("status_recreate_planned", analysis.Layers.Count);
+
+            // The fingerprint covers the pixels, the canvas, the palette and the stroke plan.
+            // A checkpoint is only ever resumed when this identical run produced it.
+            ICheckpointStore? checkpointStore = null;
+            if (!options.DryRun && options.Resume)
+            {
+                checkpointStore = new FileCheckpointStore(log: Utils.Log);
+                options.Fingerprint = RecreateFingerprint.Compute(
+                    _preFxBitmap!, options.Canvas, analysis.Palette, options);
+                options.ResumeCheckpoint = checkpointStore.Load(options.Fingerprint);
+                if (options.ResumeCheckpoint is { } checkpoint)
+                    HexedStatus("status_recreate_resume_found", checkpoint.StrokeIndex);
+            }
+            else
+            {
+                options.Resume = false;
+            }
+
+            IFocusGuard? focusGuard = null;
+            if (!options.DryRun)
+            {
+                Drawing.LastPos = new Vector2(config.DrawRegion.Left, config.DrawRegion.Top);
+                Drawing.ClipToRegion = true;
+                Drawing.ShowPopup = false;
+                Drawing.IsDrawing = true;
+                Drawing.IsPaused = _recreatePause?.IsPaused ?? false;
+                if (hexedWasVisible) _hexedDrawWindow!.WindowState = WindowState.Minimized;
+                WindowState = WindowState.Minimized;
+                minimized = true;
+                HexedStatus("status_drawing");
+
+                // Arm only after AutoDraw is out of the way; the guard ignores this process so it
+                // can never latch onto the window that is about to be minimised.
+                if (options.FocusGuard)
+                {
+                    var guard = new ForegroundWindowFocusGuard();
+                    if (!await guard.ArmAsync(token))
+                    {
+                        HexedStatus("status_recreate_focus_arm_failed");
+                        return;
+                    }
+
+                    focusGuard = guard;
+                    Utils.Log("Focus guard armed on " + guard.Description + ".");
+                }
+            }
+
+            var engine = new RecreateEngine(
+                input, picker, verifier, options, _recreatePause, Utils.Log, focusGuard, checkpointStore);
+            _recreateEngine = engine;
+            var lastStatusTicks = 0L;
+            engine.ProgressChanged += (_, progress) =>
+            {
+                Drawing.ReportExternalProgress(
+                    progress.CompletedStrokes,
+                    progress.TotalStrokes,
+                    progress.IsLayerBoundary || progress.Phase is "complete" or "dry-run");
+
+                var now = Environment.TickCount64;
+                if (!progress.IsLayerBoundary &&
+                    progress.Phase is not ("complete" or "dry-run") &&
+                    now - lastStatusTicks < 250)
+                    return;
+                lastStatusTicks = now;
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (progress.Phase is "complete" or "dry-run") return;
+                    _hexedDrawWindow?.SetStatus(LocalizationManager.F(
+                        "status_recreate_progress",
+                        progress.LayerText,
+                        progress.Percent.ToString("0.0", CultureInfo.InvariantCulture),
+                        progress.ColorHex));
+                });
+            };
+
+            if (options.DryRun)
+            {
+                var dryRun = await Task.Run(() => engine.RunAsync(analysis.Layers, token), token);
+                Drawing.ReportExternalProgress(dryRun.TotalStrokes, dryRun.TotalStrokes, true);
+                if (dryRun.PreviewBitmap is { } preview)
+                {
+                    Bitmap avaloniaPreview;
+                    try
+                    {
+                        avaloniaPreview = preview.ConvertToAvaloniaBitmap();
+                    }
+                    finally
+                    {
+                        preview.Dispose();
+                    }
+
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                    {
+                        _recreatePreviewWindow?.Close();
+                        var window = new RecreatePreviewWindow(
+                            avaloniaPreview,
+                            LocalizationManager.T("recreate_preview_title"));
+                        _recreatePreviewWindow = window;
+                        window.Closed += (_, _) =>
+                        {
+                            if (ReferenceEquals(_recreatePreviewWindow, window))
+                                _recreatePreviewWindow = null;
+                        };
+                        window.Show(this);
+                    });
+                }
+                HexedStatus("status_recreate_dry_run", dryRun.LayerCount, dryRun.TotalStrokes);
+                return;
+            }
+
+            var result = await Task.Run(() => engine.RunAsync(analysis.Layers, token), token);
+            HexedStatus("status_recreate_complete", result.LayerCount, result.DrawnStrokes);
+        }
+        catch (OperationCanceledException)
+        {
+            HexedStatus("status_recreate_cancelled");
+        }
+        catch (RecreateFocusLostException ex)
+        {
+            Utils.Log("Recreate stopped: " + ex.Message);
+            HexedStatus("status_recreate_focus_lost");
+        }
+        catch (Exception ex)
+        {
+            Utils.Log("Recreate failed: " + ex);
+            HexedStatus("status_recreate_error", ex.Message);
+        }
+        finally
+        {
+            _recreateEngine = null;
+            Drawing.ShowPopup = showPopup;
+            Drawing.IsDrawing = false;
+            Drawing.IsPaused = false;
+            _recreatePause = null;
+            _recreateRunning = false;
+            _recreateCts?.Dispose();
+            _recreateCts = null;
+            analysis?.Dispose();
+
+            if (minimized)
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    WindowState = WindowState.Normal;
+                    Activate();
+                    if (hexedWasVisible && _hexedDrawWindow is { } window)
+                    {
+                        window.WindowState = WindowState.Normal;
+                        window.Activate();
+                    }
+                });
+            }
+
+            if (Dispatcher.UIThread.CheckAccess()) _hexedDrawWindow?.RefreshFromConfig();
+            else Dispatcher.UIThread.Post(() => _hexedDrawWindow?.RefreshFromConfig());
+        }
+    }
+
     public void ResetHexedDraw()
     {
+        _recreateCts?.Cancel();
+        if (_recreatePause is { } pause) pause.IsPaused = false;
         Drawing.Halt();
         Drawing.ResetProgress();
         Drawing.ClipToRegion = false;
@@ -1697,6 +2350,9 @@ public partial class MainWindow : Window
 
     public void StopHexedDraw()
     {
+        _recreateEngine?.Abort();
+        _recreateCts?.Cancel();
+        if (_recreatePause is { } pause) pause.IsPaused = false;
         Drawing.Halt();
         Drawing.IsPaused = false;
         if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;

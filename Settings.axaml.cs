@@ -571,11 +571,6 @@ public partial class Settings : Window
         Utils.LoggingEnabled = (bool)LogFile.IsChecked;
     }
 
-    private void LocalThemeOnClick(object? sender, RoutedEventArgs e)
-    {
-        throw new NotImplementedException();
-    }
-
     private void OnPointerPressed(object? sender, PointerPressedEventArgs e)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;

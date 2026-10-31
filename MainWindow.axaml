@@ -16,7 +16,7 @@
         Width="720"
         Height="420"
         CanResize="True"
-        DragDrop.AllowDrop="False"
+        DragDrop.AllowDrop="True"
 
         MinWidth="720"
         MinHeight="420"
@@ -58,9 +58,7 @@
 
             <Menu>
                 <MenuItem Header="_AutoDraw" FontSize="9" Height="0" IsEnabled="True">
-                    <MenuItem x:Name="PasteImage" Header="_Paste Image"
-                              Command="{Binding $parent[Window].PasteControl}"
-                              CommandParameter="{Binding ElementName=MainWindow}" HotKey="Ctrl+V" />
+                    <MenuItem x:Name="PasteImage" Header="_Paste Image" Click="PasteImage_OnClick" InputGesture="Ctrl+V" />
                     <MenuItem Header="_HexedDrawer" Click="HexedDrawMenu_OnClick" />
                 </MenuItem>
             </Menu>
@@ -377,10 +375,27 @@
                     </TabControl>
                 </TabItem>
                 
-                <TabItem Header="Painting">
-                    <local:PaintingPanel x:Name="PaintingPanelMount"/>
+                <TabItem Name="ImageInputTab">
+                    <ScrollViewer>
+                        <StackPanel Margin="8" Spacing="6">
+                            <Label Name="ActionsHeaderText" FontSize="16" FontWeight="Medium" Padding="0"/>
+                            <Grid ColumnDefinitions="*,8,*">
+                                <Button Name="ActionImportButton" Grid.Column="0" HorizontalAlignment="Stretch"
+                                        HorizontalContentAlignment="Center" CornerRadius="4" Padding="4"/>
+                                <Button Name="ActionPasteButton" Grid.Column="2" HorizontalAlignment="Stretch"
+                                        HorizontalContentAlignment="Center" CornerRadius="4" Padding="4"/>
+                            </Grid>
+                            <Button Name="ActionCaptureButton" HorizontalAlignment="Stretch"
+                                    HorizontalContentAlignment="Center" CornerRadius="4" Padding="4"/>
+                            <Separator/>
+                            <Label Name="MonitorSelectLabel" FontSize="14" Padding="0"/>
+                            <ComboBox Name="MonitorCombo" HorizontalAlignment="Stretch" MinHeight="25"/>
+                            <TextBlock Name="ImageInputStatusText" FontSize="11" TextWrapping="Wrap" Margin="0 6 0 0"/>
+                            <TextBlock Name="DropHintText" FontSize="11" Foreground="#888" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </ScrollViewer>
                 </TabItem>
-                
+
             </TabControl>
             
             <Grid Grid.Row="2" Grid.Column="2" RowDefinitions="16,32">
@@ -397,5 +412,13 @@
                 </Grid>
             </Grid>
         </Grid>
+
+        <!-- Drop target highlight: shown only while a valid image drag hovers the window. -->
+        <Border Name="DropHighlight" Grid.Row="1" IsVisible="False" IsHitTestVisible="False" ZIndex="50"
+                Background="#332AA9FF" BorderBrush="#FF2AA9FF" BorderThickness="2" CornerRadius="6" Margin="8">
+            <TextBlock Name="DropHighlightText" HorizontalAlignment="Center" VerticalAlignment="Center"
+                       FontSize="16" FontWeight="Medium" Foreground="#FF2AA9FF" TextWrapping="Wrap"
+                       TextAlignment="Center" Margin="24"/>
+        </Border>
     </Grid>
 </Window>

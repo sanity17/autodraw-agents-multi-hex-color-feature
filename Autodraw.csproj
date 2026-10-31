@@ -99,6 +99,15 @@
     </ItemGroup>
 
     <ItemGroup>
+        <!-- Keep the separate xunit project out of the app's default compile/resource globs. -->
+        <Compile Remove="tests\**\*.cs"/>
+        <AvaloniaXaml Remove="tests\**\*.axaml"/>
+        <AvaloniaResource Remove="tests\**"/>
+        <EmbeddedResource Remove="tests\**"/>
+        <None Remove="tests\**"/>
+    </ItemGroup>
+
+    <ItemGroup>
         <None Remove="Assets\add-image.png"/>
         <None Remove="Assets\alert.wav"/>
         <None Remove="Assets\anime.png"/>

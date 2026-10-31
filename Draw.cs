@@ -115,37 +115,18 @@ public class InputAction
                 break;
 
             case ActionType.SetColorHex:
-                // SelectColor dispatches on PickerType (RGB / HEX / HSV / Wheel / Box /
-                // Palette Match) and falls back to the calibrated legacy wheel when the
-                // config lacks the coordinates the active type needs.
-                var pickerType = DdConfigService.Current.PickerType;
-                if (!string.IsNullOrWhiteSpace(pickerType))
+                // SelectColor dispatches on PickerType (Wheel / Box).  Never click blind
+                // coordinates: when the configured picker is not calibrated, stop the draw and
+                // tell the user where to configure it.
+                if (!ColorPicker.CanSelectCurrently)
                 {
-                    // Never click blind coordinates: when the configured picker type has not
-                    // been set up, stop the draw and tell the user where to configure it.
-                    if (!ColorPicker.CanSelectCurrently)
-                    {
-                        Drawing.Halt();
-                        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                            new MessageBox().ShowMessageBox("Color picker not set up",
-                                LocalizationManager.T("status_error_no_picker_setup"), "warn"));
-                        break;
-                    }
-                    await ColorPicker.SelectColor(Data ?? string.Empty);
+                    Drawing.Halt();
+                    Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                        new MessageBox().ShowMessageBox("Color picker not set up",
+                            LocalizationManager.T("status_error_no_picker_setup"), "warn"));
                     break;
                 }
-
-                // No configured picker type: legacy calibration, then raw text entry.
-                if (ColorPicker.IsCalibrated)
-                {
-                    await ColorPicker.SelectWheelColor(Data ?? string.Empty);
-                    break;
-                }
-                await MoveToPosition();
-                Input.SendClick(Input.MouseTypes.MouseLeft);
-                // Let the target application focus its text field before replacing it.
-                await Drawing.NOP(500_000);
-                Input.ReplaceFocusedText(Data ?? string.Empty);
+                await ColorPicker.SelectColor(Data ?? string.Empty);
                 break;
 
             case ActionType.LeftClick:
@@ -229,6 +210,11 @@ public static class Drawing
     {
         ReportProgress(0, 0, true);
     }
+
+    /// <summary>Lets the colour-layer engine drive the shared progress UI without exposing the
+    /// private throttled reporter.  Safe to call from a background thread.</summary>
+    public static void ReportExternalProgress(long drawn, long total, bool force = false)
+        => ReportProgress(drawn, total, force || drawn >= total);
 
     public static Vector2 LastPos = Config.Preview_LastLockPos;
 

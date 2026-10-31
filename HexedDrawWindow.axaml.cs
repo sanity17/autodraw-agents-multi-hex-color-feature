@@ -13,6 +13,8 @@ using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Autodraw.Configuration;
+using Autodraw.Painting.Profiles;
+using Autodraw.Painting.Recreate;
 
 namespace Autodraw;
 
@@ -28,9 +30,14 @@ public partial class HexedDrawWindow : Window
     private static readonly string[] LayerOrders = { "Brightness to darkness", "Largest area first", "Darkness to brightness" };
     private static readonly string[] StrayModes = { "Disabled", "Smart Merge (V5)" };
     private static readonly string[] DrawerModules = { "Old (No Bridge)", "New (A* Bridge)" };
-    private static readonly string[] PickerTypes = { "HEX", "RGB", "HSV", "Wheel", "Box" };
+    private static readonly string[] PickerTypes = { "Wheel", "Box" };
+    private static readonly string[] RecreateLayerOrderValues =
+        { "coverage-desc", "coverage-asc", "luminance-desc", "luminance-asc", "manual" };
+    private static readonly string[] RecreateStrokeOrderValues = { "serpentine", "nearest" };
 
     private readonly ObservableCollection<ImageSearchResult> _searchResults = new();
+    private readonly GameProfileStore _profileStore = new(log: Utils.Log);
+    private IReadOnlyList<GameProfile> _profiles = Array.Empty<GameProfile>();
     private readonly DispatcherTimer _autoQuantizeTimer;
     private readonly DispatcherTimer _uiTimer;
     private List<string> _configPaths = new();
@@ -245,45 +252,35 @@ public partial class HexedDrawWindow : Window
         SetStatus(LocalizationManager.F("status_picker_set", PickerTypeLabel(config.PickerType)));
     }
 
-    private static string PickerTypeLabel(string pickerType) => pickerType.ToLowerInvariant() switch
-    {
-        "hex" => LocalizationManager.T("picker_style_hex"),
-        "rgb" => LocalizationManager.T("picker_style_rgb"),
-        "hsv" => LocalizationManager.T("picker_style_hsv"),
-        "box" => LocalizationManager.T("picker_style_box"),
-        _ => LocalizationManager.T("picker_style_circle")
-    };
+    private static string PickerTypeLabel(string pickerType)
+        => PickerRegistry.Find(pickerType) is { } definition
+            ? LocalizationManager.T(definition.DisplayNameKey)
+            : LocalizationManager.T("picker_style_circle");
 
     /// <summary>Plain-language summary of what is calibrated for the active picker type.</summary>
     private void UpdatePickerStatus()
     {
         var config = DdConfigService.Current;
+        var definition = PickerRegistry.Find(config.PickerType);
         string detail;
-        if (config.PickerType.Equals("RGB", StringComparison.OrdinalIgnoreCase))
-            detail = config.RgbCoordinates.Count == 3
-                ? string.Join(", ", config.RgbCoordinates.Select(p => $"({p.X}, {p.Y})"))
-                : LocalizationManager.T("calib_none");
-        else if (config.PickerType.Equals("HSV", StringComparison.OrdinalIgnoreCase))
-            detail = config.HsvCoordinates.Count == 3
-                ? string.Join(", ", config.HsvCoordinates.Select(p => $"({p.X}, {p.Y})"))
-                : LocalizationManager.T("calib_none");
-        else if (config.PickerType.Equals("HEX", StringComparison.OrdinalIgnoreCase))
-            detail = config.HexCoordinate is { } hex ? $"({hex.X}, {hex.Y})" : LocalizationManager.T("calib_none");
-        else if (config.PickerType.Equals("Box", StringComparison.OrdinalIgnoreCase))
-            detail = config.BoxTopLeft is { } tl && config.BoxBottomRight is { } br
-                ? $"({tl.X}, {tl.Y}) → ({br.X}, {br.Y})"
-                : LocalizationManager.T("calib_none");
-        else if (config.IsPaletteMatchPicker)
-            detail = $"{config.PaletteSlots.Count} {LocalizationManager.T("calib_slots_count")}";
+        if (definition is null)
+        {
+            detail = LocalizationManager.T("calib_none");
+        }
         else
-            detail = config.WheelCenter is { } center && config.WheelEdge is { } edge &&
-                     config.WheelDark is not null && config.WheelBright is not null
-                ? $"({center.X}, {center.Y}) → ({edge.X}, {edge.Y})"
-                : LocalizationManager.T("calib_none");
+        {
+            var calibration = RecreateOptions.BuildCalibration(config, definition.Id);
+            detail = calibration.Points.Count == 0
+                ? LocalizationManager.T("calib_none")
+                : string.Join(", ", calibration.Points
+                    .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                    .Select(pair => $"({pair.Value.X}, {pair.Value.Y})"));
+        }
 
         var ready = ColorPicker.ConfiguredTypeIsReady();
         var state = ready ? LocalizationManager.T("calib_set") : LocalizationManager.T("calib_not_set");
         PickerStatusText.Text = $"{PickerTypeLabel(config.PickerType)} — {state}: {detail}";
+        PaletteRotationPanel.IsVisible = config.PickerType.Equals("Wheel", StringComparison.OrdinalIgnoreCase);
         PickerStatusText.Foreground = ready
             ? Avalonia.Media.SolidColorBrush.Parse("#7BC47F")
             : Avalonia.Media.SolidColorBrush.Parse("#C9A15F");
@@ -421,14 +418,218 @@ public partial class HexedDrawWindow : Window
         SetStatus(LocalizationManager.F("status_rotation_set", LocalizationManager.T(cw ? "rot_cw" : "rot_ccw")));
     }
 
-    private void Calibrate_OnClick(object? sender, RoutedEventArgs e)
+    // ------------------------------------------------------- colour-layer recreate
+
+    private void RecreateToggle_OnChanged(object? sender, RoutedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        config.MaskMode = RecreateModeCheck.IsChecked == true
+            ? LayerMaskMode.ColorLayers
+            : LayerMaskMode.LuminanceThreshold;
+        config.RecreateVerify = RecreateVerifyCheck.IsChecked == true;
+        config.RecreateDryRun = RecreateDryRunCheck.IsChecked == true;
+        config.RecreateFocusGuard = RecreateFocusCheck.IsChecked == true;
+        config.RecreateResume = RecreateResumeCheck.IsChecked == true;
+        ApplyConfig(config);
+        SetStatus(LocalizationManager.T(config.MaskMode == LayerMaskMode.ColorLayers
+            ? "status_recreate_enabled"
+            : "status_recreate_disabled"));
+        UpdateRecreateSummary();
+    }
+
+    private void RecreateCombo_OnChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        config.RecreateLayerOrder = RecreateLayerOrderValues[
+            Math.Clamp(RecreateLayerOrderCombo.SelectedIndex, 0, RecreateLayerOrderValues.Length - 1)];
+        config.RecreateStrokeOrder = RecreateStrokeOrderValues[
+            Math.Clamp(RecreateStrokeOrderCombo.SelectedIndex, 0, RecreateStrokeOrderValues.Length - 1)];
+        ApplyConfig(config);
+        SetStatus(LocalizationManager.T("status_recreate_settings_saved"));
+        UpdateRecreateSummary();
+    }
+
+    private void RecreateNumber_OnChanged(object? sender, TextChangedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        if (ReferenceEquals(sender, RecreateStrokeDelayInput))
+        {
+            if (!int.TryParse(RecreateStrokeDelayInput.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var delay))
+                return;
+            config.RecreateStrokeDelayMs = Math.Clamp(delay, 0, 60_000);
+        }
+        else if (ReferenceEquals(sender, RecreateMoveStepInput))
+        {
+            if (!int.TryParse(RecreateMoveStepInput.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var step))
+                return;
+            config.RecreateMoveStepPixels = Math.Clamp(step, 1, 512);
+        }
+        else if (ReferenceEquals(sender, RecreateAlphaInput))
+        {
+            if (!int.TryParse(RecreateAlphaInput.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var alpha))
+                return;
+            config.RecreateAlphaThreshold = Math.Clamp(alpha, 0, 255);
+        }
+        else if (ReferenceEquals(sender, RecreateVerifyToleranceInput))
+        {
+            if (!double.TryParse(RecreateVerifyToleranceInput.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var tolerance))
+                return;
+            config.RecreateVerifyTolerance = Math.Clamp(tolerance, 0, 100);
+        }
+        else if (ReferenceEquals(sender, RecreateVerifyRetriesInput))
+        {
+            if (!int.TryParse(RecreateVerifyRetriesInput.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var retries))
+                return;
+            config.RecreateVerifyRetries = Math.Clamp(retries, 0, 10);
+        }
+        else if (ReferenceEquals(sender, RecreateCheckpointInput))
+        {
+            if (!int.TryParse(RecreateCheckpointInput.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var every))
+                return;
+            config.RecreateCheckpointEvery = Math.Clamp(every, 1, 500);
+        }
+        else
+        {
+            return;
+        }
+        ApplyConfig(config);
+        SetStatus(LocalizationManager.T("status_recreate_settings_saved"));
+    }
+
+    private void UpdateRecreateSummary()
+    {
+        var config = DdConfigService.Current;
+        var current = config.RecreateCurrentColorPoint is { } point
+            ? $"({point.X}, {point.Y})"
+            : LocalizationManager.T("calib_none");
+        RecreateCalibrationStatusText.Text = LocalizationManager.F(
+            "label_recreate_calibration_state",
+            current);
+    }
+
+    private void CalibrateButton_OnClick(object? sender, RoutedEventArgs e)
+        => MainWindow.CurrentMainWindow?.BeginSelectedPickerCalibration();
+
+    /// <summary>Minimizes this window so the target picker is visible; the UI timer restores it
+    /// once the shared calibration capture ends.</summary>
+    public void HideForCalibration()
+    {
+        _calibrationRestorePending = true;
+        WindowState = WindowState.Minimized;
+    }
+
+    private void RecreateCalibrate_OnClick(object? sender, RoutedEventArgs e)
     {
         if (sender is not Button { Tag: string mode }) return;
         var main = MainWindow.CurrentMainWindow;
         if (main is null) return;
-        _calibrationRestorePending = true;
-        WindowState = WindowState.Minimized;
-        main.BeginColorPickerCalibration(mode);
+        HideForCalibration();
+        if (mode == "RecreateCurrent")
+            main.BeginRecreateCurrentColorCalibration();
+    }
+
+    // ---------------------------------------------------------------- game profiles
+
+    /// <summary>Reloads the profile list and selects the profile named in the configuration.</summary>
+    private void RefreshProfileList()
+    {
+        _profiles = _profileStore.LoadAll();
+        var names = _profiles.Select(profile => profile.Name).ToArray();
+        ProfileCombo.ItemsSource = names;
+        var active = DdConfigService.Current.PickerProfile;
+        ProfileCombo.SelectedIndex = string.IsNullOrWhiteSpace(active)
+            ? -1
+            : Array.FindIndex(names, name => string.Equals(name, active, StringComparison.CurrentCultureIgnoreCase));
+    }
+
+    private void Profile_OnChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (_updating || ProfileCombo.SelectedIndex < 0 || ProfileCombo.SelectedIndex >= _profiles.Count) return;
+        var profile = _profiles[ProfileCombo.SelectedIndex];
+        var config = DdConfigService.Current;
+        if (!profile.TryApply(config, out var applyError))
+        {
+            SetStatus(LocalizationManager.F("status_profile_apply_error", applyError));
+            return;
+        }
+
+        config.PickerProfile = profile.Name;
+        if (!DdConfigService.TryApply(config, out var error))
+        {
+            SetStatus(LocalizationManager.F("status_profile_apply_error", error));
+            return;
+        }
+
+        _updating = true;
+        ProfileNameInput.Text = profile.Name;
+        _updating = false;
+        RefreshFromConfig();
+        SetStatus(LocalizationManager.F("status_profile_applied", profile.Name));
+    }
+
+    private void ProfileSave_OnClick(object? sender, RoutedEventArgs e)
+    {
+        var name = ProfileNameInput.Text?.Trim();
+        if (string.IsNullOrWhiteSpace(name) && ProfileCombo.SelectedItem is string selected) name = selected;
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            SetStatus(LocalizationManager.T("status_profile_name_required"));
+            return;
+        }
+
+        var config = DdConfigService.Current;
+        GameProfile profile;
+        try
+        {
+            profile = GameProfile.Capture(name, config);
+        }
+        catch (ColorSelectionException ex)
+        {
+            SetStatus(LocalizationManager.F("status_profile_save_error", ex.Message));
+            return;
+        }
+
+        if (!_profileStore.Save(profile, out var error))
+        {
+            SetStatus(LocalizationManager.F("status_profile_save_error", error));
+            return;
+        }
+
+        config.PickerProfile = profile.Name;
+        ApplyConfig(config);
+        RefreshProfileList();
+        SetStatus(LocalizationManager.F("status_profile_saved", profile.Name));
+    }
+
+    private void ProfileDelete_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (ProfileCombo.SelectedItem is not string name)
+        {
+            SetStatus(LocalizationManager.T("status_profile_none_selected"));
+            return;
+        }
+
+        if (!_profileStore.Delete(name))
+        {
+            SetStatus(LocalizationManager.F("status_profile_save_error", name));
+            return;
+        }
+
+        var config = DdConfigService.Current;
+        if (string.Equals(config.PickerProfile, name, StringComparison.CurrentCultureIgnoreCase))
+        {
+            config.PickerProfile = string.Empty;
+            ApplyConfig(config);
+        }
+
+        _updating = true;
+        ProfileNameInput.Text = string.Empty;
+        _updating = false;
+        RefreshProfileList();
+        SetStatus(LocalizationManager.F("status_profile_deleted", name));
     }
 
     // ---------------------------------------------------------------- finder tab
@@ -698,13 +899,35 @@ public partial class HexedDrawWindow : Window
                       (method.StartsWith("MiniBatch") && config.KmeansAlgorithm.StartsWith("MiniBatch")) ||
                       (method.StartsWith("KMeans++") && config.KmeansAlgorithm.StartsWith("KMeans++"))));
         ColorSpaceCombo.SelectedIndex = Math.Max(0, Array.IndexOf(ColorSpaceValues,
-            config.ColorDistanceMethod?.ToUpperInvariant() ?? "RGB"));
+            RecreateOptions.NormalizeColorSpace(config.ColorDistanceMethod)));
         AlgorithmCombo.SelectedIndex = Math.Max(0, Array.IndexOf(Algorithms, config.Algorithm));
         DrawOrderCombo.SelectedIndex = Math.Max(0, Array.FindIndex(LayerOrders,
             order => order.Equals(config.LayerOrder, StringComparison.OrdinalIgnoreCase)));
         StrayRemovalCombo.SelectedIndex = config.RemoveStray ? 1 : 0;
         DrawerModuleCombo.SelectedIndex = config.DrawerModule.Contains("old", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
         PaletteRotationCombo.SelectedIndex = config.WheelDirection.Equals("CW", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+
+        RecreateModeCheck.IsChecked = config.MaskMode == LayerMaskMode.ColorLayers;
+        RecreateLayerOrderCombo.SelectedIndex = Math.Max(0, Array.IndexOf(
+            RecreateLayerOrderValues,
+            LayerOrdering.Normalize(config.RecreateLayerOrder)));
+        RecreateStrokeOrderCombo.SelectedIndex = Math.Max(0, Array.IndexOf(
+            RecreateStrokeOrderValues,
+            RecreateOptions.ParseStrokeOrder(config.RecreateStrokeOrder) == StrokeOrder.NearestNeighbor
+                ? "nearest"
+                : "serpentine"));
+        RecreateStrokeDelayInput.Text = config.RecreateStrokeDelayMs.ToString(CultureInfo.InvariantCulture);
+        RecreateMoveStepInput.Text = config.RecreateMoveStepPixels.ToString(CultureInfo.InvariantCulture);
+        RecreateAlphaInput.Text = config.RecreateAlphaThreshold.ToString(CultureInfo.InvariantCulture);
+        RecreateCheckpointInput.Text = config.RecreateCheckpointEvery.ToString(CultureInfo.InvariantCulture);
+        RecreateVerifyCheck.IsChecked = config.RecreateVerify;
+        RecreateVerifyToleranceInput.Text = config.RecreateVerifyTolerance.ToString("0.###", CultureInfo.InvariantCulture);
+        RecreateVerifyRetriesInput.Text = config.RecreateVerifyRetries.ToString(CultureInfo.InvariantCulture);
+        RecreateDryRunCheck.IsChecked = config.RecreateDryRun;
+        RecreateFocusCheck.IsChecked = config.RecreateFocusGuard;
+        RecreateResumeCheck.IsChecked = config.RecreateResume;
+        UpdateRecreateSummary();
+        RefreshProfileList();
         SafeSearchCombo.SelectedIndex = config.SafeSearch?.ToLowerInvariant() switch
         {
             "strict" => 1,
@@ -720,7 +943,7 @@ public partial class HexedDrawWindow : Window
     {
         _updating = true;
         AppTitleText.Text = LocalizationManager.T("app_title");
-        HotkeyHintText.Text = "F1 Area  |  F2 Start/Pause  |  F3 Stop  |  F4 Reset  |  F6 Quantize";
+        HotkeyHintText.Text = LocalizationManager.T("hotkey_hint");
         MainWindowButton.Content = "AutoDraw";
         TabMain.Header = LocalizationManager.T("tab_main");
         TabFinder.Header = LocalizationManager.T("tab_finder");
@@ -730,7 +953,7 @@ public partial class HexedDrawWindow : Window
 
         ControlHeaderText.Text = LocalizationManager.T("lf_control");
         SelectImageButton.Content = LocalizationManager.T("btn_select_image");
-        SelectAreaButton.Content = LocalizationManager.T("btn_select_area");
+        SelectAreaButton.Content = LocalizationManager.T("btn_select_area_only");
         QuantizeButton.Content = LocalizationManager.T("btn_quantize");
         DrawButton.Content = LocalizationManager.T("btn_draw");
         ResetButton.Content = LocalizationManager.T("btn_reset");
@@ -749,18 +972,8 @@ public partial class HexedDrawWindow : Window
         ColorPickerHeaderText.Text = LocalizationManager.T("lf_color_picker_style");
         PickerTypeLabel1.Text = LocalizationManager.T("picker_type_label");
         PickerTypeCombo.ItemsSource = PickerTypes.Select(PickerTypeLabel).ToArray();
-        CalibrateHexButton.Content = LocalizationManager.T("set_hex");
-        CalibrateRgbButton.Content = LocalizationManager.T("set_rgb");
-        CalibrateHsvButton.Content = LocalizationManager.T("set_hsv");
-        FieldCalibrationHeaderText.Text = LocalizationManager.T("lf_calib_text");
-        CircleCalibrationHeaderText.Text = LocalizationManager.T("lf_calib_circle");
-        CalibrateCircleButton.Content = LocalizationManager.T("btn_calib_circle");
-        CalibrateBrightnessButton.Content = LocalizationManager.T("btn_calib_slider");
+        CalibrateButton.Content = LocalizationManager.T("btn_calibrate");
         PaletteRotationLabel.Text = LocalizationManager.T("label_palette_rotation");
-        BoxCalibrationHeaderText.Text = LocalizationManager.T("lf_calib_box");
-        CalibrateHueButton.Content = LocalizationManager.T("btn_calib_rainbow");
-        CalibrateBoxButton.Content = LocalizationManager.T("btn_calib_box");
-        CalibrateBoxAllButton.Content = LocalizationManager.T("btn_calib_boxall");
         UpdatePickerStatus();
         ModeHeaderText.Text = LocalizationManager.T("lf_mode");
         ColorModeRadio.Content = LocalizationManager.T("mode_color");
@@ -779,6 +992,46 @@ public partial class HexedDrawWindow : Window
         DrawOrderLabel.Text = LocalizationManager.T("label_draw_order");
         StrayPixelLabel.Text = LocalizationManager.T("label_stray_pixel");
         DrawerModuleLabel.Text = LocalizationManager.T("label_drawer_module");
+
+        RecreateHeaderText.Text = LocalizationManager.T("lf_recreate");
+        RecreateModeCheck.Content = LocalizationManager.T("check_recreate_mode");
+        RecreateModeHintText.Text = LocalizationManager.T("hint_recreate_mode");
+        ProfileHeaderText.Text = LocalizationManager.T("lf_profiles");
+        ProfileLabel.Text = LocalizationManager.T("label_profile");
+        ProfileNameLabel.Text = LocalizationManager.T("label_profile_name");
+        ProfileSaveButton.Content = LocalizationManager.T("btn_profile_save");
+        ProfileDeleteButton.Content = LocalizationManager.T("btn_profile_delete");
+        RecreateLayerOrderLabel.Text = LocalizationManager.T("label_recreate_layer_order");
+        RecreateLayerOrderCombo.ItemsSource = new[]
+        {
+            LocalizationManager.T("recreate_order_coverage_desc"),
+            LocalizationManager.T("recreate_order_coverage_asc"),
+            LocalizationManager.T("recreate_order_luminance_desc"),
+            LocalizationManager.T("recreate_order_luminance_asc"),
+            LocalizationManager.T("recreate_order_manual")
+        };
+        RecreateStrokeOrderLabel.Text = LocalizationManager.T("label_recreate_stroke_order");
+        RecreateStrokeOrderCombo.ItemsSource = new[]
+        {
+            LocalizationManager.T("recreate_stroke_serpentine"),
+            LocalizationManager.T("recreate_stroke_nearest")
+        };
+        RecreateStrokeHintText.Text = LocalizationManager.T("hint_recreate_stroke_order");
+        RecreateStrokeDelayLabel.Text = LocalizationManager.T("label_recreate_stroke_delay");
+        RecreateMoveStepLabel.Text = LocalizationManager.T("label_recreate_move_step");
+        RecreateAlphaLabel.Text = LocalizationManager.T("label_recreate_alpha");
+        RecreateCheckpointLabel.Text = LocalizationManager.T("label_recreate_checkpoint_every");
+        RecreateVerifyCheck.Content = LocalizationManager.T("check_recreate_verify");
+        RecreateVerifyToleranceLabel.Text = LocalizationManager.T("label_recreate_tolerance");
+        RecreateVerifyRetriesLabel.Text = LocalizationManager.T("label_recreate_retries");
+        RecreateDryRunCheck.Content = LocalizationManager.T("check_recreate_dry_run");
+        RecreateFocusCheck.Content = LocalizationManager.T("check_recreate_focus_guard");
+        RecreateResumeCheck.Content = LocalizationManager.T("check_recreate_resume");
+        RecreateSafetyHintText.Text = LocalizationManager.T("hint_recreate_safety");
+        PaletteSpaceHintText.Text = LocalizationManager.T("hint_palette_space");
+        RecreateCalibrationHeaderText.Text = LocalizationManager.T("lf_recreate_calibration");
+        RecreateCurrentButton.Content = LocalizationManager.T("btn_recreate_current");
+        UpdateRecreateSummary();
 
         ConfigManagementHeaderText.Text = LocalizationManager.T("lf_config_mgmt");
         LoadConfigButton.Content = LocalizationManager.T("btn_load_config");
@@ -834,5 +1087,19 @@ public partial class HexedDrawWindow : Window
         LanguageCombo.SelectedItem = LocalizationManager.Find(LocalizationManager.CurrentCode);
         if (SafeSearchCombo.SelectedIndex < 0) SafeSearchCombo.SelectedIndex = 0;
         _updating = false;
+    }
+
+    /// <summary>Ctrl+V anywhere in the HexedDrawer window pastes an image from the clipboard. Text
+    /// fields keep their normal paste behaviour.</summary>
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.Key == Key.V && (e.KeyModifiers & KeyModifiers.Control) != 0 &&
+            TopLevel.GetTopLevel(this)?.FocusManager?.GetFocusedElement() is not TextBox)
+        {
+            e.Handled = true;
+            _ = MainWindow.CurrentMainWindow?.PasteImageFromClipboardAsync();
+        }
+
+        base.OnKeyDown(e);
     }
 }
