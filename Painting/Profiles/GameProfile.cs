@@ -19,6 +19,7 @@ public sealed class GameProfile
     [JsonProperty("name")] public string Name { get; set; } = string.Empty;
     [JsonProperty("picker_type")] public string PickerType { get; set; } = "Wheel";
     [JsonProperty("points")] public Dictionary<string, ScreenPoint> Points { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    [JsonProperty("palette_slots")] public List<PaletteSlot> PaletteSlots { get; set; } = new();
     [JsonProperty("wheel_direction")] public string WheelDirection { get; set; } = "CCW";
     [JsonProperty("verify_point"), JsonConverter(typeof(NullableScreenPointConverter))]
     public ScreenPoint? VerifyPoint { get; set; }
@@ -36,6 +37,7 @@ public sealed class GameProfile
             Name = string.IsNullOrWhiteSpace(name) ? "Default" : name.Trim(),
             PickerType = pickerType,
             Points = calibration.Points.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase),
+            PaletteSlots = calibration.PaletteSlots.ToList(),
             WheelDirection = string.Equals(config.WheelDirection, "CW", StringComparison.OrdinalIgnoreCase) ? "CW" : "CCW",
             VerifyPoint = config.RecreateCurrentColorPoint,
             UpdatedUtc = DateTime.UtcNow
@@ -57,6 +59,7 @@ public sealed class GameProfile
 
         var calibration = new PickerCalibration(definition.Id);
         foreach (var pair in Points) calibration.Set(pair.Key, pair.Value);
+        calibration.SetPaletteSlots(PaletteSlots ?? new List<PaletteSlot>());
 
         var validation = definition.Validate(calibration, ScreenGeometry.TryGetVirtualScreenBounds());
         if (validation is not null)
@@ -169,6 +172,7 @@ public sealed class GameProfileStore
             var profile = JsonConvert.DeserializeObject<GameProfile>(File.ReadAllText(path), Settings);
             if (profile is null || string.IsNullOrWhiteSpace(profile.Name)) return null;
             if (profile.Points is null) profile.Points = new Dictionary<string, ScreenPoint>(StringComparer.OrdinalIgnoreCase);
+            profile.PaletteSlots ??= new List<PaletteSlot>();
             return profile;
         }
         catch (Exception ex)

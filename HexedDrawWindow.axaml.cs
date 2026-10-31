@@ -18,19 +18,19 @@ using Autodraw.Painting.Recreate;
 
 namespace Autodraw;
 
-/// <summary>HexedDrawer feature port: a dedicated window with the Main / Image Finder /
-/// Settings / Config / Language tabs. It drives the shared image-processing and drawing
+/// <summary>LxPainter-compatible seven-tab window: General / Advanced Quantize / Color Picker /
+/// Remove BG / Image Finder / Config / Language. It drives the shared processing and drawing
 /// services owned by <see cref="MainWindow"/> so both workflows use the same layers and config.</summary>
 public partial class HexedDrawWindow : Window
 {
     private static readonly string[] QuantizeStyles = { "Pixelated (Classic)", "Vectorized (Smooth)" };
-    private static readonly string[] QuantizeMethods = { "MiniBatchKMeans (Fast)", "KMeans++ (Classic)", "Median Cut", "Div", "NeuQuant Neural-Net" };
+    private static readonly string[] QuantizeMethods = { "MiniBatchKMeans (Fast)", "KMeans++ (Classic)", "KMeans++ (Original)", "KMeans (Random)", "Median Cut", "Div", "NeuQuant Neural-Net", "Lab Color Space" };
     private static readonly string[] ColorSpaceValues = { "RGB", "OKLAB", "CIELAB" };
     private static readonly string[] Algorithms = { "DFS (Default)", "Edge Traversal", "Concentric" };
     private static readonly string[] LayerOrders = { "Brightness to darkness", "Largest area first", "Darkness to brightness" };
     private static readonly string[] StrayModes = { "Disabled", "Smart Merge (V5)" };
     private static readonly string[] DrawerModules = { "Old (No Bridge)", "New (A* Bridge)" };
-    private static readonly string[] PickerTypes = { "Wheel", "Box" };
+    private static readonly string[] PickerTypes = { "HEX", "RGB", "HSV", "Wheel", "Box", "Palette Match" };
     private static readonly string[] RecreateLayerOrderValues =
         { "coverage-desc", "coverage-asc", "luminance-desc", "luminance-asc", "manual" };
     private static readonly string[] RecreateStrokeOrderValues = { "serpentine", "nearest" };
@@ -230,10 +230,90 @@ public partial class HexedDrawWindow : Window
             config.DrawDelaySeconds = Math.Max(0, seconds);
             config.Interval = (long)Math.Clamp(seconds * 10_000_000d, 0, long.MaxValue);
         }
+        else if (ReferenceEquals(sender, PixelSizeInput))
+        {
+            if (!int.TryParse(PixelSizeInput.Text, out var value)) return;
+            config.PixelSize = Math.Clamp(value, 1, 64);
+        }
+        else if (ReferenceEquals(sender, IntervalInput))
+        {
+            if (!long.TryParse(IntervalInput.Text, out var value)) return;
+            config.Interval = Math.Max(0, value);
+            config.DrawDelaySeconds = config.Interval / 10_000_000d;
+        }
+        else if (ReferenceEquals(sender, ClickDelayInput))
+        {
+            if (!double.TryParse(ClickDelayInput.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)) return;
+            config.ClickDelay = Math.Max(0, value);
+        }
+        else if (ReferenceEquals(sender, CustomWidthInput) || ReferenceEquals(sender, CustomHeightInput))
+        {
+            if (!int.TryParse(((TextBox)sender).Text, out var value)) return;
+            if (ReferenceEquals(sender, CustomWidthInput)) config.CustomWidth = Math.Clamp(value, 0, 16384);
+            else config.CustomHeight = Math.Clamp(value, 0, 16384);
+        }
+        else if (ReferenceEquals(sender, StencilOpacityInput))
+        {
+            if (!int.TryParse(StencilOpacityInput.Text, out var value)) return;
+            config.StencilOpacity = Math.Clamp(value, 0, 100);
+        }
+        else if (ReferenceEquals(sender, SearchLimitInput))
+        {
+            if (!int.TryParse(SearchLimitInput.Text, out var value)) return;
+            config.SearchLimit = Math.Clamp(value, 1, 100);
+        }
         else
         {
             return;
         }
+        ApplyConfig(config);
+        ScheduleAutoQuantize();
+    }
+
+    private void DrawMethod_OnChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (_updating || DrawMethodCombo.SelectedIndex < 0) return;
+        var config = DdConfigService.Current;
+        config.DrawMethod = DrawMethodCombo.SelectedIndex == 0 ? "Line" : "1:1 Exact (AutoDraw)";
+        ApplyConfig(config);
+    }
+
+    private void GeneralToggle_OnChanged(object? sender, RoutedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        config.LockShape = LockShapeCheck.IsChecked == true;
+        config.StencilEnabled = StencilEnabledCheck.IsChecked == true;
+        ApplyConfig(config);
+    }
+
+    private void AdvancedToggle_OnChanged(object? sender, RoutedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        config.UseBilateral = UseBilateralCheck.IsChecked == true;
+        config.UseSeeds = UseSeedsCheck.IsChecked == true;
+        ApplyConfig(config);
+        ScheduleAutoQuantize();
+    }
+
+    private void AdvancedNumber_OnChanged(object? sender, TextChangedEventArgs e)
+    {
+        if (_updating || sender is not TextBox input || !double.TryParse(input.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)) return;
+        var config = DdConfigService.Current;
+        if (ReferenceEquals(input, LumWeightInput)) config.LabLumWeight = Math.Max(0, value);
+        else if (ReferenceEquals(input, ChromaWeightInput)) config.LabChromaWeight = Math.Max(0, value);
+        else if (ReferenceEquals(input, HueWeightInput)) config.LabHueWeight = Math.Max(0, value);
+        else if (ReferenceEquals(input, ContrastThresholdInput)) config.LabContrastThreshold = Math.Max(0, value);
+        else if (ReferenceEquals(input, SpatialSigmaInput)) config.LabSpatialSigma = Math.Max(.001, value);
+        else if (ReferenceEquals(input, SpatialIterationsInput)) config.LabSpatialIterations = Math.Clamp((int)value, 1, 8);
+        else if (ReferenceEquals(input, EdgePreservationInput)) config.LabEdgePreservation = Math.Max(0, value);
+        else if (ReferenceEquals(input, RangeSigmaInput)) config.LabRangeSigma = Math.Max(.001, value);
+        else if (ReferenceEquals(input, SeedsCountInput)) config.SeedsCount = Math.Clamp((int)value, 1, 10_000_000);
+        else if (ReferenceEquals(input, BilateralDiameterInput)) config.BilateralDiameter = Math.Clamp((int)value, 1, 33);
+        else if (ReferenceEquals(input, BilateralColorSigmaInput)) config.BilateralColorSigma = Math.Max(.001, value);
+        else if (ReferenceEquals(input, BilateralSpaceSigmaInput)) config.BilateralSpaceSigma = Math.Max(.001, value);
+        else return;
         ApplyConfig(config);
         ScheduleAutoQuantize();
     }
@@ -270,11 +350,13 @@ public partial class HexedDrawWindow : Window
         else
         {
             var calibration = RecreateOptions.BuildCalibration(config, definition.Id);
-            detail = calibration.Points.Count == 0
-                ? LocalizationManager.T("calib_none")
-                : string.Join(", ", calibration.Points
-                    .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-                    .Select(pair => $"({pair.Value.X}, {pair.Value.Y})"));
+            detail = definition.Id == "Palette Match"
+                ? (calibration.PaletteSlots.Count == 0 ? LocalizationManager.T("calib_none") : $"{calibration.PaletteSlots.Count} captured swatches")
+                : calibration.Points.Count == 0
+                    ? LocalizationManager.T("calib_none")
+                    : string.Join(", ", calibration.Points
+                        .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                        .Select(pair => $"({pair.Value.X}, {pair.Value.Y})"));
         }
 
         var ready = ColorPicker.ConfiguredTypeIsReady();
@@ -334,12 +416,8 @@ public partial class HexedDrawWindow : Window
         var index = Math.Clamp(QuantizeMethodCombo.SelectedIndex, 0, QuantizeMethods.Length - 1);
         var config = DdConfigService.Current;
         config.QuantizeMethod = QuantizeMethods[index];
-        config.KmeansAlgorithm = index switch
-        {
-            0 => "MiniBatchKMeans (Fast)",
-            1 => "KMeans++ (Original)",
-            _ => config.KmeansAlgorithm
-        };
+        if (config.QuantizeMethod.Contains("KMeans", StringComparison.OrdinalIgnoreCase))
+            config.KmeansAlgorithm = config.QuantizeMethod;
         ApplyConfig(config);
         SetStatus(LocalizationManager.F("status_qmethod_changed", QuantizeMethodCombo.SelectedItem?.ToString() ?? config.QuantizeMethod));
         ScheduleAutoQuantize();
@@ -511,7 +589,115 @@ public partial class HexedDrawWindow : Window
     }
 
     private void CalibrateButton_OnClick(object? sender, RoutedEventArgs e)
-        => MainWindow.CurrentMainWindow?.BeginSelectedPickerCalibration();
+    {
+        HideForCalibration();
+        MainWindow.CurrentMainWindow?.BeginSelectedPickerCalibration();
+    }
+
+    private void PickerCalibration_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string picker } || MainWindow.CurrentMainWindow is not { } main) return;
+        var config = DdConfigService.Current;
+        config.PickerType = picker;
+        config.ColorPickingMethod = "Circle";
+        if (!DdConfigService.TryApply(config, out var error)) { SetStatus(error); return; }
+        HideForCalibration();
+        main.BeginSelectedPickerCalibration();
+    }
+
+    private void PickerPartCalibration_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string part } || MainWindow.CurrentMainWindow is not { } main) return;
+        HideForCalibration();
+        main.BeginPickerPartCalibration(part);
+    }
+
+    private void CapturePalette_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (MainWindow.CurrentMainWindow is not { } main) return;
+        HideForCalibration();
+        main.BeginPaletteCapture();
+    }
+
+    private void ClearPalette_OnClick(object? sender, RoutedEventArgs e)
+    {
+        var config = DdConfigService.Current;
+        config.CapturedPalette.Clear();
+        config.PaletteSlots.Clear();
+        ApplyConfig(config);
+        UpdatePickerStatus();
+    }
+
+    private void MacroToggle_OnChanged(object? sender, RoutedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        config.EnableMacros = EnableMacrosCheck.IsChecked == true;
+        ApplyConfig(config);
+    }
+
+    private void MacroCalibration_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string mode } || MainWindow.CurrentMainWindow is not { } main) return;
+        HideForCalibration();
+        main.BeginMacroCalibration(mode == "Open");
+    }
+
+    private void MacroNumber_OnChanged(object? sender, TextChangedEventArgs e)
+    {
+        if (_updating || sender is not TextBox input || !double.TryParse(input.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)) return;
+        var config = DdConfigService.Current;
+        if (ReferenceEquals(input, DelayOpenInput)) config.DelayOpen = Math.Max(0, value);
+        else if (ReferenceEquals(input, DelayInputInput)) config.DelayInput = Math.Max(0, value);
+        else if (ReferenceEquals(input, DelayCloseInput)) config.DelayClose = Math.Max(0, value);
+        else return;
+        ApplyConfig(config);
+    }
+
+    private void PickBackground_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (MainWindow.CurrentMainWindow is not { } main) return;
+        HideForCalibration();
+        main.BeginBackgroundColorCapture();
+    }
+
+    private void ClearBackground_OnClick(object? sender, RoutedEventArgs e)
+    {
+        var config = DdConfigService.Current;
+        config.BackgroundColorsToRemove.Clear();
+        ApplyConfig(config);
+        UpdateBackgroundSummary();
+        ScheduleAutoQuantize();
+    }
+
+    private void BackgroundNumber_OnChanged(object? sender, TextChangedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        if (string.IsNullOrWhiteSpace(BackgroundToleranceInput.Text)) config.BackgroundTolerance = null;
+        else if (double.TryParse(BackgroundToleranceInput.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            config.BackgroundTolerance = Math.Clamp(value, 0, 255);
+        else return;
+        ApplyConfig(config);
+        ScheduleAutoQuantize();
+    }
+
+    private void BackgroundToggle_OnChanged(object? sender, RoutedEventArgs e)
+    {
+        if (_updating) return;
+        var config = DdConfigService.Current;
+        config.RemoveBackground = RemoveBackgroundCheck.IsChecked == true;
+        ApplyConfig(config);
+        ScheduleAutoQuantize();
+    }
+
+    private void UpdateBackgroundSummary()
+    {
+        var config = DdConfigService.Current;
+        BackgroundColorsText.Text = config.BackgroundColorsToRemove.Count == 0
+            ? Label("background_none", "No background colours selected.")
+            : string.Join(", ", config.BackgroundColorsToRemove);
+    }
 
     /// <summary>Minimizes this window so the target picker is visible; the UI timer restores it
     /// once the shared calibration capture ends.</summary>
@@ -734,6 +920,15 @@ public partial class HexedDrawWindow : Window
 
     // ---------------------------------------------------------------- config tab
 
+    private void RefreshConfig_OnClick(object? sender, RoutedEventArgs e) => RefreshConfigList();
+
+    private void ResetConfig_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (!DdConfigService.TryApply(new AutoDrawConfig(), out var error)) { SetStatus(error); return; }
+        RefreshFromConfig();
+        SetStatus(Label("status_reset_default", "Configuration reset to defaults."));
+    }
+
     private void RefreshConfigList()
     {
         _configPaths = HexedDrawConfigMapper.ListConfigs().ToList();
@@ -881,6 +1076,38 @@ public partial class HexedDrawWindow : Window
         KClustersInput.Text = config.KClusters.ToString(CultureInfo.InvariantCulture);
         BrushSizeInput.Text = config.BrushSize.ToString(CultureInfo.InvariantCulture);
         DrawDelayInput.Text = (config.DrawDelaySeconds ?? config.Interval / 10_000_000d).ToString("0.######", CultureInfo.InvariantCulture);
+        PixelSizeInput.Text = config.PixelSize.ToString(CultureInfo.InvariantCulture);
+        IntervalInput.Text = config.Interval.ToString(CultureInfo.InvariantCulture);
+        ClickDelayInput.Text = config.ClickDelay.ToString("0.######", CultureInfo.InvariantCulture);
+        CustomWidthInput.Text = config.CustomWidth.ToString(CultureInfo.InvariantCulture);
+        CustomHeightInput.Text = config.CustomHeight.ToString(CultureInfo.InvariantCulture);
+        StencilOpacityInput.Text = config.StencilOpacity.ToString(CultureInfo.InvariantCulture);
+        SearchLimitInput.Text = config.SearchLimit.ToString(CultureInfo.InvariantCulture);
+        LockShapeCheck.IsChecked = config.LockShape;
+        StencilEnabledCheck.IsChecked = config.StencilEnabled;
+        DrawMethodCombo.SelectedIndex = config.DrawMethod.Equals("Line", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
+        UseBilateralCheck.IsChecked = config.UseBilateral;
+        UseSeedsCheck.IsChecked = config.UseSeeds;
+        LumWeightInput.Text = config.LabLumWeight.ToString("0.###", CultureInfo.InvariantCulture);
+        ChromaWeightInput.Text = config.LabChromaWeight.ToString("0.###", CultureInfo.InvariantCulture);
+        HueWeightInput.Text = config.LabHueWeight.ToString("0.###", CultureInfo.InvariantCulture);
+        ContrastThresholdInput.Text = config.LabContrastThreshold.ToString("0.###", CultureInfo.InvariantCulture);
+        SpatialSigmaInput.Text = config.LabSpatialSigma.ToString("0.###", CultureInfo.InvariantCulture);
+        SpatialIterationsInput.Text = config.LabSpatialIterations.ToString(CultureInfo.InvariantCulture);
+        EdgePreservationInput.Text = config.LabEdgePreservation.ToString("0.###", CultureInfo.InvariantCulture);
+        RangeSigmaInput.Text = config.LabRangeSigma.ToString("0.###", CultureInfo.InvariantCulture);
+        SeedsCountInput.Text = config.SeedsCount.ToString(CultureInfo.InvariantCulture);
+        BilateralDiameterInput.Text = config.BilateralDiameter.ToString(CultureInfo.InvariantCulture);
+        BilateralColorSigmaInput.Text = config.BilateralColorSigma.ToString("0.###", CultureInfo.InvariantCulture);
+        BilateralSpaceSigmaInput.Text = config.BilateralSpaceSigma.ToString("0.###", CultureInfo.InvariantCulture);
+        EnableMacrosCheck.IsChecked = config.EnableMacros;
+        DelayOpenInput.Text = config.DelayOpen.ToString("0.###", CultureInfo.InvariantCulture);
+        DelayInputInput.Text = config.DelayInput.ToString("0.###", CultureInfo.InvariantCulture);
+        DelayCloseInput.Text = config.DelayClose.ToString("0.###", CultureInfo.InvariantCulture);
+        BackgroundToleranceInput.Text = config.BackgroundTolerance?.ToString("0.###", CultureInfo.InvariantCulture) ?? string.Empty;
+        RemoveBackgroundCheck.IsChecked = config.RemoveBackground;
+        PaletteStatusText.Text = $"{config.PaletteSlots.Count} / {config.CapturedPalette.Count}";
+        UpdateBackgroundSummary();
 
         PickerTypeCombo.ItemsSource = PickerTypes.Select(PickerTypeLabel).ToArray();
         PickerTypeCombo.SelectedIndex = Math.Max(0, Array.FindIndex(PickerTypes,
@@ -894,10 +1121,11 @@ public partial class HexedDrawWindow : Window
         Dfs4Radio.IsChecked = config.DfsMode.Contains('4');
 
         QuantizeStyleCombo.SelectedIndex = Math.Max(0, Array.IndexOf(QuantizeStyles, config.QuantizeStyle));
-        QuantizeMethodCombo.SelectedIndex = Math.Max(0, Array.FindIndex(QuantizeMethods,
-            method => method.Equals(config.QuantizeMethod, StringComparison.OrdinalIgnoreCase) ||
-                      (method.StartsWith("MiniBatch") && config.KmeansAlgorithm.StartsWith("MiniBatch")) ||
-                      (method.StartsWith("KMeans++") && config.KmeansAlgorithm.StartsWith("KMeans++"))));
+        var quantizeIndex = Array.FindIndex(QuantizeMethods,
+            method => method.Equals(config.QuantizeMethod, StringComparison.OrdinalIgnoreCase));
+        if (quantizeIndex < 0) quantizeIndex = Array.FindIndex(QuantizeMethods,
+            method => method.Equals(config.KmeansAlgorithm, StringComparison.OrdinalIgnoreCase));
+        QuantizeMethodCombo.SelectedIndex = Math.Max(0, quantizeIndex);
         ColorSpaceCombo.SelectedIndex = Math.Max(0, Array.IndexOf(ColorSpaceValues,
             RecreateOptions.NormalizeColorSpace(config.ColorDistanceMethod)));
         AlgorithmCombo.SelectedIndex = Math.Max(0, Array.IndexOf(Algorithms, config.Algorithm));
@@ -945,9 +1173,11 @@ public partial class HexedDrawWindow : Window
         AppTitleText.Text = LocalizationManager.T("app_title");
         HotkeyHintText.Text = LocalizationManager.T("hotkey_hint");
         MainWindowButton.Content = "AutoDraw";
-        TabMain.Header = LocalizationManager.T("tab_main");
-        TabFinder.Header = LocalizationManager.T("tab_finder");
-        TabSettings.Header = LocalizationManager.T("tab_settings");
+        TabMain.Header = Label("tab_general", LocalizationManager.T("tab_main"));
+        TabSettings.Header = Label("tab_adv_quantize", LocalizationManager.T("tab_settings"));
+        TabColorPicker.Header = Label("tab_color_picker", "Color Picker");
+        TabRemoveBackground.Header = Label("tab_remove_bg", "Remove BG");
+        TabFinder.Header = Label("tab_image_finder", LocalizationManager.T("tab_finder"));
         TabConfig.Header = LocalizationManager.T("tab_config");
         TabLanguage.Header = LocalizationManager.T("tab_language");
 
@@ -962,6 +1192,16 @@ public partial class HexedDrawWindow : Window
         KClustersLabel.Text = LocalizationManager.T("label_k_clusters");
         DrawDelayLabel.Text = LocalizationManager.T("label_draw_delay");
         BrushSizeLabel.Text = LocalizationManager.T("label_brush_size");
+        PixelSizeLabel.Text = Label("pixel_size", "Pixel Size:");
+        IntervalLabel.Text = Label("interval", "Interval (x100ns):");
+        ClickDelayLabel.Text = Label("click_delay", "Click Delay (s):");
+        CustomWidthLabel.Text = Label("custom_w", "Custom W (0=Auto):");
+        CustomHeightLabel.Text = Label("custom_h", "Custom H (0=Auto):");
+        StencilOpacityLabel.Text = Label("stencil_opacity", "Stencil Opacity (%):");
+        DrawMethodLabel.Text = Label("method", "Method:");
+        LockShapeCheck.Content = Label("lock_shape", "Lock Shape Dimensions");
+        StencilEnabledCheck.Content = Label("stencil_enabled", "Toggle Stencil (F7)");
+        DrawMethodCombo.ItemsSource = new[] { "Line", "1:1 Exact (AutoDraw)" };
         PreviewHeaderText.Text = LocalizationManager.T("lf_preview");
         PreviewHintText.Text = LocalizationManager.T("label_preview_area");
 
@@ -974,6 +1214,28 @@ public partial class HexedDrawWindow : Window
         PickerTypeCombo.ItemsSource = PickerTypes.Select(PickerTypeLabel).ToArray();
         CalibrateButton.Content = LocalizationManager.T("btn_calibrate");
         PaletteRotationLabel.Text = LocalizationManager.T("label_palette_rotation");
+        SetHexButton.Content = Label("set_hex", "Set HEX Field (F5)");
+        SetRgbButton.Content = Label("set_rgb", "Set R, G, B Fields (F5)");
+        SetHsvButton.Content = Label("set_hsv", "Set H, S, V Fields (F5)");
+        CapturePaletteButton.Content = Label("capture_palette", "Capture Palette (F5)");
+        ClearPaletteButton.Content = Label("clear_palette", "Clear Palette");
+        CalibrateCircleButton.Content = Label("calib_circle", "Calibrate Color Circle (Center then Red Edge)");
+        CalibrateBrightnessButton.Content = Label("calib_slider", "Calibrate Brightness Slider (Dark then Bright)");
+        CalibrateHueButton.Content = Label("calib_hue", "Calibrate Hue Slider (Start then End)");
+        CalibrateBoxButton.Content = Label("calib_box", "Calibrate Sat/Val Box (Top-Left then Bottom-Right)");
+        MacroSettingsHeaderText.Text = Label("macro_settings", "Macro Settings (Optional)");
+        EnableMacrosCheck.Content = Label("enable_macros", "Enable Macros");
+        SetOpenPickerButton.Content = Label("set_open_picker", "Set Open Picker Pos");
+        SetClosePickerButton.Content = Label("set_close_picker", "Set Close Picker Pos");
+        DelayOpenLabel.Text = Label("delay_open", "Open Delay (s):");
+        DelayInputLabel.Text = Label("delay_input", "Input Delay (s):");
+        DelayCloseLabel.Text = Label("delay_close", "Close Delay (s):");
+        BackgroundColorsLabel.Text = Label("colors_to_remove", "Colors to Remove:");
+        PickBackgroundButton.Content = Label("pick_color_screen", "Pick Color from Screen");
+        ClearBackgroundButton.Content = Label("clear_colors", "Clear Colors");
+        BackgroundToleranceLabel.Text = Label("tolerance", "Tolerance (0-255):");
+        RemoveBackgroundCheck.Content = Label("apply_rmbg", "Apply Background Removal");
+        UpdateBackgroundSummary();
         UpdatePickerStatus();
         ModeHeaderText.Text = LocalizationManager.T("lf_mode");
         ColorModeRadio.Content = LocalizationManager.T("mode_color");
@@ -1029,6 +1291,21 @@ public partial class HexedDrawWindow : Window
         RecreateResumeCheck.Content = LocalizationManager.T("check_recreate_resume");
         RecreateSafetyHintText.Text = LocalizationManager.T("hint_recreate_safety");
         PaletteSpaceHintText.Text = LocalizationManager.T("hint_palette_space");
+        AdvancedFiltersHeaderText.Text = Label("adv_filters", "Advanced Filters");
+        UseBilateralCheck.Content = Label("enable_bilateral", "Enable Bilateral Filter (Pre-process)");
+        UseSeedsCheck.Content = Label("use_seeds", "Use SEEDS Superpixels (Pre-process)");
+        LumWeightLabel.Text = Label("lum_weight", "Lum Weight:");
+        ChromaWeightLabel.Text = Label("chroma_weight", "Chroma Weight:");
+        HueWeightLabel.Text = Label("hue_weight", "Hue Weight:");
+        ContrastThresholdLabel.Text = Label("contrast_thresh", "Contrast Thresh:");
+        SpatialSigmaLabel.Text = Label("spatial_sigma", "Spatial Sigma:");
+        SpatialIterationsLabel.Text = Label("spatial_iter", "Spatial Iter:");
+        EdgePreservationLabel.Text = Label("edge_preserv", "Edge Preserv:");
+        RangeSigmaLabel.Text = Label("range_sigma", "Range Sigma:");
+        SeedsCountLabel.Text = Label("desired_superpixels", "Desired Superpixels:");
+        BilateralDiameterLabel.Text = Label("diameter", "Diameter:");
+        BilateralColorSigmaLabel.Text = Label("sigma_color", "Sigma Color:");
+        BilateralSpaceSigmaLabel.Text = Label("sigma_space", "Sigma Space:");
         RecreateCalibrationHeaderText.Text = LocalizationManager.T("lf_recreate_calibration");
         RecreateCurrentButton.Content = LocalizationManager.T("btn_recreate_current");
         UpdateRecreateSummary();
@@ -1038,6 +1315,9 @@ public partial class HexedDrawWindow : Window
         SaveConfigButton.Content = LocalizationManager.T("btn_save_config");
         SaveConfigAsButton.Content = LocalizationManager.T("btn_save_config_as");
         ExportHexedConfigButton.Content = Label("btn_export_hexed", "Export HexedDrawer JSON...");
+        RefreshConfigButton.Content = Label("refresh_list", "Refresh List");
+        ResetConfigButton.Content = Label("reset_default", "Reset to Default");
+        SearchLimitInput.Watermark = Label("search_limit", "Limit:");
         CurrentConfigLabel.Text = LocalizationManager.T("label_current_config");
 
         LanguageSelectHeaderText.Text = LocalizationManager.T("lf_language_select");
@@ -1050,9 +1330,12 @@ public partial class HexedDrawWindow : Window
         {
             Label("qmethod_minibatch", QuantizeMethods[0]),
             Label("qmethod_kmeans", QuantizeMethods[1]),
-            Label("qmethod_median", QuantizeMethods[2]),
-            Label("qmethod_div", QuantizeMethods[3]),
-            Label("qmethod_neuquant", QuantizeMethods[4])
+            QuantizeMethods[2],
+            QuantizeMethods[3],
+            Label("qmethod_median", QuantizeMethods[4]),
+            Label("qmethod_div", QuantizeMethods[5]),
+            Label("qmethod_neuquant", QuantizeMethods[6]),
+            QuantizeMethods[7]
         };
         ColorSpaceCombo.ItemsSource = new[] { "sRGB", "OKLAB", "CIELAB" };
         AlgorithmCombo.ItemsSource = Algorithms;

@@ -42,18 +42,46 @@
                     <ScrollViewer Grid.Column="2">
                         <StackPanel Spacing="6" Margin="4">
                             <TextBlock Name="ParametersHeaderText" FontWeight="Bold"/>
-                            <Grid ColumnDefinitions="*,8,*">
-                                <StackPanel Grid.Column="0">
+                            <Grid ColumnDefinitions="*,8,*" RowDefinitions="Auto,6,Auto,6,Auto,6,Auto">
+                                <StackPanel Grid.Row="0" Grid.Column="0">
                                     <TextBlock Name="KClustersLabel" TextWrapping="Wrap"/>
                                     <TextBox Name="KClustersInput" TextChanged="Parameter_OnChanged"/>
                                 </StackPanel>
-                                <StackPanel Grid.Column="2">
+                                <StackPanel Grid.Row="0" Grid.Column="2">
                                     <TextBlock Name="BrushSizeLabel" TextWrapping="Wrap"/>
                                     <TextBox Name="BrushSizeInput" TextChanged="Parameter_OnChanged"/>
                                 </StackPanel>
+                                <StackPanel Grid.Row="2" Grid.Column="0">
+                                    <TextBlock Name="PixelSizeLabel" TextWrapping="Wrap"/>
+                                    <TextBox Name="PixelSizeInput" TextChanged="Parameter_OnChanged"/>
+                                </StackPanel>
+                                <StackPanel Grid.Row="2" Grid.Column="2">
+                                    <TextBlock Name="DrawDelayLabel" TextWrapping="Wrap"/>
+                                    <TextBox Name="DrawDelayInput" TextChanged="Parameter_OnChanged"/>
+                                </StackPanel>
+                                <StackPanel Grid.Row="4" Grid.Column="0">
+                                    <TextBlock Name="IntervalLabel" TextWrapping="Wrap"/>
+                                    <TextBox Name="IntervalInput" TextChanged="Parameter_OnChanged"/>
+                                </StackPanel>
+                                <StackPanel Grid.Row="4" Grid.Column="2">
+                                    <TextBlock Name="ClickDelayLabel" TextWrapping="Wrap"/>
+                                    <TextBox Name="ClickDelayInput" TextChanged="Parameter_OnChanged"/>
+                                </StackPanel>
+                                <StackPanel Grid.Row="6" Grid.Column="0">
+                                    <TextBlock Name="CustomWidthLabel" TextWrapping="Wrap"/>
+                                    <TextBox Name="CustomWidthInput" TextChanged="Parameter_OnChanged"/>
+                                </StackPanel>
+                                <StackPanel Grid.Row="6" Grid.Column="2">
+                                    <TextBlock Name="CustomHeightLabel" TextWrapping="Wrap"/>
+                                    <TextBox Name="CustomHeightInput" TextChanged="Parameter_OnChanged"/>
+                                </StackPanel>
                             </Grid>
-                            <TextBlock Name="DrawDelayLabel"/>
-                            <TextBox Name="DrawDelayInput" Width="180" HorizontalAlignment="Left" TextChanged="Parameter_OnChanged"/>
+                            <TextBlock Name="DrawMethodLabel"/>
+                            <ComboBox Name="DrawMethodCombo" HorizontalAlignment="Stretch" SelectionChanged="DrawMethod_OnChanged"/>
+                            <CheckBox Name="LockShapeCheck" Checked="GeneralToggle_OnChanged" Unchecked="GeneralToggle_OnChanged"/>
+                            <CheckBox Name="StencilEnabledCheck" Checked="GeneralToggle_OnChanged" Unchecked="GeneralToggle_OnChanged"/>
+                            <TextBlock Name="StencilOpacityLabel"/>
+                            <TextBox Name="StencilOpacityInput" Width="140" HorizontalAlignment="Left" TextChanged="Parameter_OnChanged"/>
 
                             <TextBlock Name="PreviewHeaderText" FontWeight="Bold" Margin="0 8 0 0"/>
                             <Border Background="#22000000" BorderBrush="#33FFFFFF" BorderThickness="1"
@@ -76,65 +104,10 @@
                 </Grid>
             </TabItem>
 
-            <!--IMAGE FINDER-->
-            <TabItem Name="TabFinder">
-                <Grid RowDefinitions="Auto,*,Auto" Margin="6">
-                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto,Auto" Margin="0 0 0 6">
-                        <TextBox Name="SearchQueryInput" Grid.Column="0" Watermark="Search images..."
-                                 KeyDown="SearchQuery_OnKeyDown"/>
-                        <ComboBox Name="SafeSearchCombo" Grid.Column="1" Width="130" Margin="6 0"
-                                  SelectionChanged="SafeSearch_OnChanged"/>
-                        <Button Name="FindImagesButton" Grid.Column="2" Click="FindImages_OnClick"/>
-                    </Grid>
-
-                    <ListBox Grid.Row="1" Name="SearchResultsList" SelectionMode="Single">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <Grid ColumnDefinitions="132,8,*,Auto" Height="104">
-                                    <Border Grid.Column="0" Background="#22000000" CornerRadius="3">
-                                        <Image Source="{Binding Thumbnail}" Stretch="UniformToFill"/>
-                                    </Border>
-                                    <StackPanel Grid.Column="2" Margin="0 4">
-                                        <TextBlock Text="{Binding Title}" TextWrapping="Wrap" MaxLines="2"
-                                                   FontWeight="SemiBold"/>
-                                        <TextBlock Text="{Binding ImageUrl}" TextWrapping="Wrap" MaxLines="2"
-                                                   FontSize="11" Foreground="#8B98A5"/>
-                                    </StackPanel>
-                                    <Button Grid.Column="3" Padding="10 4" VerticalAlignment="Center"
-                                            Click="UseSearchResult_OnClick" Content="Use"/>
-                                </Grid>
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
-
-                    <Grid Grid.Row="2" ColumnDefinitions="*,Auto" Margin="0 6 0 0">
-                        <ProgressBar Name="SearchProgressBar" Grid.Column="0" IsIndeterminate="True" IsVisible="False"
-                                     VerticalAlignment="Center"/>
-                        <Button Name="ClearCacheButton" Grid.Column="1" Click="ClearCache_OnClick"/>
-                    </Grid>
-                </Grid>
-            </TabItem>
-
             <!--SETTINGS-->
             <TabItem Name="TabSettings">
                 <ScrollViewer Padding="8">
                     <StackPanel Spacing="10">
-                        <TextBlock Name="ColorPickerHeaderText" FontWeight="Bold"/>
-                        <Grid ColumnDefinitions="Auto,8,*">
-                            <TextBlock Name="PickerTypeLabel1" VerticalAlignment="Center"/>
-                            <ComboBox Name="PickerTypeCombo" Grid.Column="2" HorizontalAlignment="Stretch"
-                                      SelectionChanged="PickerType_OnChanged"/>
-                        </Grid>
-                        <TextBlock Name="PickerStatusText" TextWrapping="Wrap" FontSize="11" Foreground="#8B98A5"/>
-
-                        <Button Name="CalibrateButton" Click="CalibrateButton_OnClick" Margin="0 6 0 0"
-                                HorizontalAlignment="Left"/>
-                        <StackPanel Name="PaletteRotationPanel" Orientation="Horizontal" Spacing="8">
-                            <TextBlock Name="PaletteRotationLabel" VerticalAlignment="Center"/>
-                            <ComboBox Name="PaletteRotationCombo" Width="120"
-                                      SelectionChanged="PaletteRotation_OnChanged"/>
-                        </StackPanel>
-
                         <TextBlock Name="ModeHeaderText" FontWeight="Bold" Margin="0 6 0 0"/>
                         <StackPanel Orientation="Horizontal" Spacing="16">
                             <RadioButton Name="ColorModeRadio" GroupName="DrawMode" Checked="Mode_OnChanged"/>
@@ -162,6 +135,38 @@
                         </Grid>
                         <TextBlock Name="PaletteSpaceHintText" FontSize="11" Foreground="#8B98A5"
                                    TextWrapping="Wrap"/>
+
+                        <TextBlock Name="AdvancedFiltersHeaderText" FontWeight="Bold" Margin="0 6 0 0"/>
+                        <CheckBox Name="UseBilateralCheck" Checked="AdvancedToggle_OnChanged" Unchecked="AdvancedToggle_OnChanged"/>
+                        <CheckBox Name="UseSeedsCheck" Checked="AdvancedToggle_OnChanged" Unchecked="AdvancedToggle_OnChanged"/>
+                        <Grid ColumnDefinitions="Auto,8,*,16,Auto,8,*" RowDefinitions="Auto,6,Auto,6,Auto,6,Auto,6,Auto">
+                            <TextBlock Name="LumWeightLabel" Grid.Row="0" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="LumWeightInput" Grid.Row="0" Grid.Column="2" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="ChromaWeightLabel" Grid.Row="0" Grid.Column="4" VerticalAlignment="Center"/>
+                            <TextBox Name="ChromaWeightInput" Grid.Row="0" Grid.Column="6" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="HueWeightLabel" Grid.Row="2" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="HueWeightInput" Grid.Row="2" Grid.Column="2" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="ContrastThresholdLabel" Grid.Row="2" Grid.Column="4" VerticalAlignment="Center"/>
+                            <TextBox Name="ContrastThresholdInput" Grid.Row="2" Grid.Column="6" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="SpatialSigmaLabel" Grid.Row="4" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="SpatialSigmaInput" Grid.Row="4" Grid.Column="2" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="SpatialIterationsLabel" Grid.Row="4" Grid.Column="4" VerticalAlignment="Center"/>
+                            <TextBox Name="SpatialIterationsInput" Grid.Row="4" Grid.Column="6" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="EdgePreservationLabel" Grid.Row="6" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="EdgePreservationInput" Grid.Row="6" Grid.Column="2" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="RangeSigmaLabel" Grid.Row="6" Grid.Column="4" VerticalAlignment="Center"/>
+                            <TextBox Name="RangeSigmaInput" Grid.Row="6" Grid.Column="6" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="SeedsCountLabel" Grid.Row="8" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="SeedsCountInput" Grid.Row="8" Grid.Column="2" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="BilateralDiameterLabel" Grid.Row="8" Grid.Column="4" VerticalAlignment="Center"/>
+                            <TextBox Name="BilateralDiameterInput" Grid.Row="8" Grid.Column="6" TextChanged="AdvancedNumber_OnChanged"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="Auto,8,*" RowDefinitions="Auto,6,Auto">
+                            <TextBlock Name="BilateralColorSigmaLabel" Grid.Row="0" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="BilateralColorSigmaInput" Grid.Row="0" Grid.Column="2" TextChanged="AdvancedNumber_OnChanged"/>
+                            <TextBlock Name="BilateralSpaceSigmaLabel" Grid.Row="2" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="BilateralSpaceSigmaInput" Grid.Row="2" Grid.Column="2" TextChanged="AdvancedNumber_OnChanged"/>
+                        </Grid>
 
                         <TextBlock Name="RecreateHeaderText" FontWeight="Bold" Margin="0 6 0 0"/>
                         <CheckBox Name="RecreateModeCheck" Checked="RecreateToggle_OnChanged"
@@ -253,6 +258,113 @@
                 </ScrollViewer>
             </TabItem>
 
+            <!--COLOR PICKER-->
+            <TabItem Name="TabColorPicker">
+                <ScrollViewer Padding="8">
+                    <StackPanel Spacing="10">
+                        <TextBlock Name="ColorPickerHeaderText" FontWeight="Bold"/>
+                        <Grid ColumnDefinitions="Auto,8,*">
+                            <TextBlock Name="PickerTypeLabel1" VerticalAlignment="Center"/>
+                            <ComboBox Name="PickerTypeCombo" Grid.Column="2" HorizontalAlignment="Stretch"
+                                      SelectionChanged="PickerType_OnChanged"/>
+                        </Grid>
+                        <TextBlock Name="PickerStatusText" TextWrapping="Wrap" FontSize="11" Foreground="#8B98A5"/>
+
+                        <Button Name="CalibrateButton" Click="CalibrateButton_OnClick" Margin="0 6 0 0"
+                                HorizontalAlignment="Left"/>
+                        <StackPanel Name="PaletteRotationPanel" Orientation="Horizontal" Spacing="8">
+                            <TextBlock Name="PaletteRotationLabel" VerticalAlignment="Center"/>
+                            <ComboBox Name="PaletteRotationCombo" Width="120"
+                                      SelectionChanged="PaletteRotation_OnChanged"/>
+                        </StackPanel>
+
+                        <Grid ColumnDefinitions="*,8,*" RowDefinitions="Auto,6,Auto,6,Auto">
+                            <Button Name="SetHexButton" Grid.Row="0" Grid.Column="0" Tag="HEX" Click="PickerCalibration_OnClick"/>
+                            <Button Name="SetRgbButton" Grid.Row="0" Grid.Column="2" Tag="RGB" Click="PickerCalibration_OnClick"/>
+                            <Button Name="SetHsvButton" Grid.Row="2" Grid.Column="0" Tag="HSV" Click="PickerCalibration_OnClick"/>
+                            <Button Name="CapturePaletteButton" Grid.Row="2" Grid.Column="2" Click="CapturePalette_OnClick"/>
+                            <Button Name="ClearPaletteButton" Grid.Row="4" Grid.Column="0" Click="ClearPalette_OnClick"/>
+                            <TextBlock Name="PaletteStatusText" Grid.Row="4" Grid.Column="2" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                        </Grid>
+                        <Button Name="CalibrateCircleButton" Tag="Circle" Click="PickerPartCalibration_OnClick"/>
+                        <Button Name="CalibrateBrightnessButton" Tag="Brightness" Click="PickerPartCalibration_OnClick"/>
+                        <Button Name="CalibrateHueButton" Tag="Hue" Click="PickerPartCalibration_OnClick"/>
+                        <Button Name="CalibrateBoxButton" Tag="Box" Click="PickerPartCalibration_OnClick"/>
+                        <TextBlock Name="MacroSettingsHeaderText" FontWeight="Bold" Margin="0 8 0 0"/>
+                        <CheckBox Name="EnableMacrosCheck" Checked="MacroToggle_OnChanged" Unchecked="MacroToggle_OnChanged"/>
+                        <Grid ColumnDefinitions="*,8,*">
+                            <Button Name="SetOpenPickerButton" Grid.Column="0" Tag="Open" Click="MacroCalibration_OnClick"/>
+                            <Button Name="SetClosePickerButton" Grid.Column="2" Tag="Close" Click="MacroCalibration_OnClick"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="Auto,8,*" RowDefinitions="Auto,6,Auto,6,Auto">
+                            <TextBlock Name="DelayOpenLabel" Grid.Row="0" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="DelayOpenInput" Grid.Row="0" Grid.Column="2" TextChanged="MacroNumber_OnChanged"/>
+                            <TextBlock Name="DelayInputLabel" Grid.Row="2" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="DelayInputInput" Grid.Row="2" Grid.Column="2" TextChanged="MacroNumber_OnChanged"/>
+                            <TextBlock Name="DelayCloseLabel" Grid.Row="4" Grid.Column="0" VerticalAlignment="Center"/>
+                            <TextBox Name="DelayCloseInput" Grid.Row="4" Grid.Column="2" TextChanged="MacroNumber_OnChanged"/>
+                        </Grid>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!--REMOVE BACKGROUND-->
+            <TabItem Name="TabRemoveBackground">
+                <ScrollViewer Padding="12">
+                    <StackPanel Spacing="10">
+                        <TextBlock Name="BackgroundColorsLabel" FontWeight="Bold"/>
+                        <TextBlock Name="BackgroundColorsText" TextWrapping="Wrap" MinHeight="48"/>
+                        <Grid ColumnDefinitions="*,8,*">
+                            <Button Name="PickBackgroundButton" Grid.Column="0" Click="PickBackground_OnClick"/>
+                            <Button Name="ClearBackgroundButton" Grid.Column="2" Click="ClearBackground_OnClick"/>
+                        </Grid>
+                        <TextBlock Name="BackgroundToleranceLabel"/>
+                        <TextBox Name="BackgroundToleranceInput" Width="180" HorizontalAlignment="Left" TextChanged="BackgroundNumber_OnChanged"/>
+                        <CheckBox Name="RemoveBackgroundCheck" Checked="BackgroundToggle_OnChanged" Unchecked="BackgroundToggle_OnChanged"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!--IMAGE FINDER-->
+            <TabItem Name="TabFinder">
+                <Grid RowDefinitions="Auto,*,Auto" Margin="6">
+                    <Grid Grid.Row="0" ColumnDefinitions="*,64,Auto,Auto" Margin="0 0 0 6">
+                        <TextBox Name="SearchQueryInput" Grid.Column="0" Watermark="Search images..."
+                                 KeyDown="SearchQuery_OnKeyDown"/>
+                        <TextBox Name="SearchLimitInput" Grid.Column="1" Margin="6 0" TextChanged="Parameter_OnChanged"/>
+                        <ComboBox Name="SafeSearchCombo" Grid.Column="2" Width="130" Margin="0 0 6 0"
+                                  SelectionChanged="SafeSearch_OnChanged"/>
+                        <Button Name="FindImagesButton" Grid.Column="3" Click="FindImages_OnClick"/>
+                    </Grid>
+
+                    <ListBox Grid.Row="1" Name="SearchResultsList" SelectionMode="Single">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Grid ColumnDefinitions="132,8,*,Auto" Height="104">
+                                    <Border Grid.Column="0" Background="#22000000" CornerRadius="3">
+                                        <Image Source="{Binding Thumbnail}" Stretch="UniformToFill"/>
+                                    </Border>
+                                    <StackPanel Grid.Column="2" Margin="0 4">
+                                        <TextBlock Text="{Binding Title}" TextWrapping="Wrap" MaxLines="2"
+                                                   FontWeight="SemiBold"/>
+                                        <TextBlock Text="{Binding ImageUrl}" TextWrapping="Wrap" MaxLines="2"
+                                                   FontSize="11" Foreground="#8B98A5"/>
+                                    </StackPanel>
+                                    <Button Grid.Column="3" Padding="10 4" VerticalAlignment="Center"
+                                            Click="UseSearchResult_OnClick" Content="Use"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <Grid Grid.Row="2" ColumnDefinitions="*,Auto" Margin="0 6 0 0">
+                        <ProgressBar Name="SearchProgressBar" Grid.Column="0" IsIndeterminate="True" IsVisible="False"
+                                     VerticalAlignment="Center"/>
+                        <Button Name="ClearCacheButton" Grid.Column="1" Click="ClearCache_OnClick"/>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
             <!--CONFIG-->
             <TabItem Name="TabConfig">
                 <Grid RowDefinitions="Auto,Auto,*,Auto" Margin="8">
@@ -262,6 +374,8 @@
                         <Button Name="SaveConfigButton" Click="SaveConfig_OnClick"/>
                         <Button Name="SaveConfigAsButton" Click="SaveConfigAs_OnClick"/>
                         <Button Name="ExportHexedConfigButton" Click="ExportHexedConfig_OnClick"/>
+                        <Button Name="RefreshConfigButton" Click="RefreshConfig_OnClick"/>
+                        <Button Name="ResetConfigButton" Click="ResetConfig_OnClick"/>
                     </StackPanel>
                     <ListBox Grid.Row="2" Name="ConfigList" DoubleTapped="ConfigList_OnDoubleTapped"/>
                     <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="6" Margin="0 6 0 0">

@@ -508,6 +508,20 @@ public static class ImageProcessing
         var histogram = BuildHistogram(sourceBitmap, alphaThreshold, config);
         if (histogram.Count == 0) return new();
 
+        // A captured target palette is a hard colour constraint, not a KMeans seed. Returning
+        // only real swatch colours guarantees that every subsequent picker selection exists in
+        // the target application. If more swatches were captured than requested, retain a
+        // deterministic, perceptually distributed subset without inventing new colours.
+        if (config?.CapturedPalette is { Count: > 0 })
+        {
+            var fixedPalette = config.CapturedPalette
+                .Select(value => SKColor.TryParse(value, out var color) ? color : SKColors.Transparent)
+                .Where(color => color != SKColors.Transparent)
+                .Distinct()
+                .ToList();
+            if (fixedPalette.Count > 0) return SelectFixedPalette(fixedPalette, paletteSize);
+        }
+
         // Scale candidate count with actual unique-color diversity, but never exceed the histogram.
         var candidateBudget = Math.Max(paletteSize * 8, Math.Min(histogram.Count, paletteSize * 64));
         var candidates = histogram
@@ -538,6 +552,28 @@ public static class ImageProcessing
         // Default path: KMeans++.  The legacy "NeuQuant Neural-Net", MiniBatch and NeuQuant labels are
         // treated as the KMeans path, matching the historical (silent) behaviour.
         return KMeans(candidates, paletteSize, config);
+    }
+
+    private static List<SKColor> SelectFixedPalette(List<SKColor> colors, int paletteSize)
+    {
+        if (colors.Count <= paletteSize) return colors;
+        var selected = new HashSet<int> { 0 };
+        while (selected.Count < paletteSize)
+        {
+            var bestIndex = -1;
+            var bestDistance = -1d;
+            for (var i = 0; i < colors.Count; i++)
+            {
+                if (selected.Contains(i)) continue;
+                var nearest = selected.Min(index => ColorMatcher.DeltaE2000(colors[i], colors[index]));
+                if (nearest <= bestDistance) continue;
+                bestDistance = nearest;
+                bestIndex = i;
+            }
+            if (bestIndex < 0) break;
+            selected.Add(bestIndex);
+        }
+        return colors.Where((_, index) => selected.Contains(index)).ToList();
     }
 
     private static unsafe Dictionary<int, int> BuildHistogram(SKBitmap sourceBitmap, byte alphaThreshold, AutoDrawConfig? config)
@@ -1076,8 +1112,10 @@ public static class ImageProcessing
         }
 
         if (config?.RemoveStray == true) MergeStrayPixels(results, width, height);
-        if (config?.QuantizeStyle?.Contains("vector", StringComparison.OrdinalIgnoreCase) == true)
-            SmoothLayerAssignments(results, width, height);
+        if (config?.UseSeeds == true && config.LabSpatialIterations > 0)
+            SmoothLayerAssignments(results, width, height, config);
+        else if (config?.QuantizeStyle?.Contains("vector", StringComparison.OrdinalIgnoreCase) == true)
+            SmoothLayerAssignments(results, width, height, null);
         return results;
     }
 
@@ -1159,40 +1197,61 @@ public static class ImageProcessing
         }
     }
 
-    /// <summary>Majority-vote cleanup used by the Vectorized (Smooth) quantize style.</summary>
-    private static unsafe void SmoothLayerAssignments(IReadOnlyList<ColorLayerResult> layers, int width, int height)
+    /// <summary>Majority-vote cleanup for Vectorized mode, or spatial/range weighted cleanup for SEEDS.</summary>
+    private static unsafe void SmoothLayerAssignments(IReadOnlyList<ColorLayerResult> layers, int width, int height, AutoDrawConfig? config)
     {
         var pointers = new uint*[layers.Count];
         for (var i = 0; i < layers.Count; i++) pointers[i] = (uint*)layers[i].Bitmap.GetPixels().ToPointer();
-        for (var pass = 0; pass < 2; pass++)
+        var spatial = Math.Max(config?.LabSpatialSigma ?? 1d, .001);
+        var range = Math.Max(config?.LabRangeSigma ?? 10d, .001);
+        var edge = Math.Max(config?.LabEdgePreservation ?? 0d, 0d);
+        var radius = config is null ? 1 : Math.Clamp((int)Math.Round(config.LabSpatialSigma), 1, 6);
+        var passes = config is null ? 2 : Math.Clamp(config.LabSpatialIterations, 0, 8);
+        for (var pass = 0; pass < passes; pass++)
         {
             var labels = BuildLabelMap(layers, width, height);
             var moves = new List<(int X, int Y, int From, int To)>();
-            var counts = new int[layers.Count];
+            var counts = new double[layers.Count];
             for (var y = 0; y < height; y++)
             for (var x = 0; x < width; x++)
             {
                 var from = labels[y * width + x];
                 if (from < 0) continue;
                 Array.Clear(counts);
-                var total = 0;
-                for (var dy = -1; dy <= 1; dy++)
-                for (var dx = -1; dx <= 1; dx++)
+                var total = 0d;
+                for (var dy = -radius; dy <= radius; dy++)
+                for (var dx = -radius; dx <= radius; dx++)
                 {
-                    if (dx == 0 && dy == 0) continue;
+                    if (config is null && dx == 0 && dy == 0) continue;
                     var nx = x + dx;
                     var ny = y + dy;
                     if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
                     var label = labels[ny * width + nx];
                     if (label < 0) continue;
-                    counts[label]++;
-                    total++;
+                    var weight = 1d;
+                    if (config is not null)
+                    {
+                        var first = layers[from].Color;
+                        var second = layers[label].Color;
+                        var dr = first.Red - second.Red;
+                        var dg = first.Green - second.Green;
+                        var db = first.Blue - second.Blue;
+                        var difference = dr * dr + dg * dg + db * db;
+                        weight = Math.Exp(-(dx * dx + dy * dy) / (2 * spatial * spatial))
+                                 * Math.Exp(-(1 + edge) * difference / (2 * range * range));
+                    }
+                    counts[label] += weight;
+                    total += weight;
                 }
-                if (total < 4) continue;
                 var best = from;
                 for (var i = 0; i < counts.Length; i++)
                     if (counts[i] > counts[best]) best = i;
-                if (best != from && counts[best] >= 4) moves.Add((x, y, from, best));
+                if (config is null)
+                {
+                    if (total >= 4 && best != from && counts[best] >= 4) moves.Add((x, y, from, best));
+                }
+                else if (best != from && counts[best] > counts[from] * 1.05)
+                    moves.Add((x, y, from, best));
             }
 
             foreach (var (x, y, from, to) in moves)
@@ -1237,19 +1296,37 @@ public static class ImageProcessing
         return labels;
     }
 
+    /// <summary>Applies LxPainter custom dimensions. Zero means automatic; specifying only one
+    /// dimension preserves aspect ratio. The caller owns the returned independent bitmap.</summary>
+    public static SKBitmap ResizeToCustomDimensions(SKBitmap source, AutoDrawConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(config);
+        var width = Math.Max(0, config.CustomWidth);
+        var height = Math.Max(0, config.CustomHeight);
+        if (width == 0 && height == 0) return source.Copy();
+        if (width == 0) width = Math.Max(1, (int)Math.Round(source.Width * (height / (double)source.Height)));
+        if (height == 0) height = Math.Max(1, (int)Math.Round(source.Height * (width / (double)source.Width)));
+        if (width == source.Width && height == source.Height) return source.Copy();
+        return source.Resize(new SKSizeI(width, height), SKFilterQuality.High);
+    }
+
     /// <summary>Copies a bitmap and makes configured background colours transparent before colour quantization.</summary>
     public static SKBitmap PrepareColorImage(SKBitmap source, AutoDrawConfig config)
     {
         var output = source.Copy();
-        var background = config.BackgroundColorsToRemove.Select(SKColor.Parse).ToArray();
-        if (background.Length == 0 && !config.UseBilateral) return output;
-        if (background.Length > 0)
+        var background = config.BackgroundColorsToRemove
+            .Select(value => SKColor.TryParse(value, out var color) ? color : SKColors.Transparent)
+            .Where(color => color != SKColors.Transparent)
+            .ToArray();
+        if ((!config.RemoveBackground || background.Length == 0) && !config.UseBilateral) return output;
+        if (config.RemoveBackground && background.Length > 0)
         {
             for (var y = 0; y < output.Height; y++)
             for (var x = 0; x < output.Width; x++)
             {
                 var c = output.GetPixel(x, y);
-                if (background.Any(bg => ColorMatcher.DeltaE2000(bg, c) <= config.LabContrastThreshold))
+                if (background.Any(bg => IsBackgroundMatch(c, bg, config)))
                     output.SetPixel(x, y, new SKColor(0, 0, 0, 0));
             }
         }
@@ -1257,6 +1334,18 @@ public static class ImageProcessing
         var filtered = ApplyBilateral(output, config);
         output.Dispose();
         return filtered;
+    }
+
+    private static bool IsBackgroundMatch(SKColor color, SKColor background, AutoDrawConfig config)
+    {
+        if (config.BackgroundTolerance is { } tolerance)
+        {
+            var red = color.Red - background.Red;
+            var green = color.Green - background.Green;
+            var blue = color.Blue - background.Blue;
+            return Math.Sqrt(red * red + green * green + blue * blue) <= tolerance;
+        }
+        return ColorMatcher.DeltaE2000(background, color) <= config.LabContrastThreshold;
     }
 
     // Deliberately bounded radius: a configuration import must not turn a large image into an unbounded operation.

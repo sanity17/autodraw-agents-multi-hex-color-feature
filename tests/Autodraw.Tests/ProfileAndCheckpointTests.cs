@@ -99,7 +99,7 @@ public class GameProfileTests : IDisposable
     public void Apply_RejectsAnUnsupportedPicker()
     {
         var profile = GameProfile.Capture("Roblox", WheelConfig());
-        profile.PickerType = "Hex";
+        profile.PickerType = "Eyedropper";
 
         Assert.False(profile.TryApply(new AutoDrawConfig(), out var error));
         Assert.Contains("does not support", error, StringComparison.OrdinalIgnoreCase);

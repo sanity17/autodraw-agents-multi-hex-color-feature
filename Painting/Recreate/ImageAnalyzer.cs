@@ -55,7 +55,8 @@ public static class ImageAnalyzer
         // instance, so clustering and layer masks can never disagree about the space.
         config.ColorDistanceMethod = RecreateOptions.NormalizeColorSpace(options.PaletteColorSpace);
 
-        using var prepared = ImageProcessing.PrepareColorImage(source, config);
+        using var sized = ImageProcessing.ResizeToCustomDimensions(source, config);
+        using var prepared = ImageProcessing.PrepareColorImage(sized, config);
         cancellationToken.ThrowIfCancellationRequested();
 
         var palette = Quantizer.ExtractPalette(

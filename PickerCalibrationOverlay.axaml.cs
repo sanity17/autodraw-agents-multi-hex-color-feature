@@ -18,11 +18,22 @@ public partial class PickerCalibrationOverlay : Window
     public bool Cancelled { get; private set; }
 
     public event EventHandler? CancelRequested;
+    public event EventHandler? DoneRequested;
+    public event EventHandler? UndoRequested;
 
     public PickerCalibrationOverlay()
     {
         InitializeComponent();
         CancelButton.Click += (_, _) => RequestCancel();
+        DoneButton.Click += (_, _) => DoneRequested?.Invoke(this, EventArgs.Empty);
+        UndoButton.Click += (_, _) => UndoRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void ShowCompletionActions(bool show, bool canUndo = false)
+    {
+        DoneButton.IsVisible = show;
+        UndoButton.IsVisible = show;
+        UndoButton.IsEnabled = canUndo;
     }
 
     public void SetStep(int completed, int total, string nextStepDescription, string title)
@@ -61,10 +72,15 @@ public partial class PickerCalibrationOverlay : Window
     {
         base.OnClosing(e);
         CancelRequested = null; // detach so the natural close-on-finish doesn't count as a cancellation
+        DoneRequested = null;
+        UndoRequested = null;
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
     {
         if (e.Key == Key.Escape) RequestCancel();
+        if (e.Key == Key.Enter && DoneButton.IsVisible) DoneRequested?.Invoke(this, EventArgs.Empty);
+        if (e.Key == Key.Z && e.KeyModifiers.HasFlag(KeyModifiers.Control) && UndoButton.IsVisible)
+            UndoRequested?.Invoke(this, EventArgs.Empty);
     }
 }

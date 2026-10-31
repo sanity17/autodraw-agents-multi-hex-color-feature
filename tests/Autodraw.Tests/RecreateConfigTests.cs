@@ -26,7 +26,7 @@ public class RecreateConfigTests
         Assert.Equal(200, config.RecreateAlphaThreshold);
         Assert.Null(config.RecreateCurrentColorPoint);
 
-        // The two pickers that ship: the wheel is the default because most games use one.
+        // All six pickers ship; the wheel remains the backward-compatible default.
         Assert.Equal("Wheel", config.PickerType);
         Assert.Equal(string.Empty, config.PickerProfile);
         Assert.Equal("CCW", config.WheelDirection);
@@ -152,7 +152,7 @@ public class RecreateConfigTests
     }
 
     [Fact]
-    public void Pickers_MigrateLegacyValuesAndKeepBox()
+    public void Pickers_PreserveLegacyFieldPickersAndKeepBox()
     {
         var legacyHex = JsonConvert.DeserializeObject<AutoDrawConfig>("""{ "picker_type": "Hex field" }""")!;
         var legacyRgb = JsonConvert.DeserializeObject<AutoDrawConfig>("""{ "picker_type": "RGB inputs" }""")!;
@@ -164,8 +164,8 @@ public class RecreateConfigTests
         DdConfigService.Normalize(box);
         DdConfigService.Normalize(missing);
 
-        Assert.Equal("Wheel", legacyHex.PickerType);
-        Assert.Equal("Wheel", legacyRgb.PickerType);
+        Assert.Equal("HEX", legacyHex.PickerType);
+        Assert.Equal("RGB", legacyRgb.PickerType);
         Assert.Equal("Box", box.PickerType);
         Assert.Equal("Box", box.ColorPickingMethod);
         Assert.Equal("Wheel", missing.PickerType);
@@ -278,11 +278,10 @@ public class RecreateConfigTests
     }
 
     [Fact]
-    public void LegacyDdJson_WithRetiredPickerType_StillLoads()
+    public void LegacyDdJson_WithFieldPicker_PreservesPickerAndSettings()
     {
-        // dd.json written by a build that still shipped the HEX / RGB / HSV pickers.  Loading it
-        // must migrate the picker to the wheel instead of discarding the whole file, otherwise
-        // every existing user loses their region, delays and palette settings on upgrade.
+        // LxPainter and older dd.json files retain their field picker instead of being silently
+        // converted to the wheel, which would click an entirely different target UI.
         const string json = """
         {
           "picker_type": "hex",
@@ -297,7 +296,7 @@ public class RecreateConfigTests
         {
             Assert.True(DdConfigService.TryLoad(path, out var config, out var error), error);
             Assert.NotNull(config);
-            Assert.Equal("Wheel", config!.PickerType);
+            Assert.Equal("HEX", config!.PickerType);
             Assert.Equal(12300000, config.Interval);
             Assert.Equal(32, config.KClusters);
         }
@@ -447,17 +446,18 @@ public class RecreateConfigTests
     }
 
     [Fact]
-    public void PickerRegistry_ContainsExactlyTheTwoSupportedPickers()
+    public void PickerRegistry_ContainsExactlyTheSixSupportedPickers()
     {
         var ids = Autodraw.Painting.Recreate.PickerRegistry.All
             .Select(definition => definition.Id)
-            .OrderBy(id => id)
             .ToArray();
 
-        Assert.Equal(new[] { "Box", "Wheel" }, ids);
+        Assert.Equal(6, ids.Length);
+        Assert.Equal(new[] { "HEX", "RGB", "HSV", "Wheel", "Box", "Palette Match" }, ids);
         Assert.True(Autodraw.Painting.Recreate.PickerRegistry.Supports("Wheel"));
         Assert.True(Autodraw.Painting.Recreate.PickerRegistry.Supports("box"));
-        Assert.False(Autodraw.Painting.Recreate.PickerRegistry.Supports("Hex"));
+        Assert.True(Autodraw.Painting.Recreate.PickerRegistry.Supports("Hex"));
+        Assert.True(Autodraw.Painting.Recreate.PickerRegistry.Supports("palette_match"));
     }
 
     [Fact]

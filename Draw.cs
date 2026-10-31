@@ -115,7 +115,7 @@ public class InputAction
                 break;
 
             case ActionType.SetColorHex:
-                // SelectColor dispatches on PickerType (Wheel / Box).  Never click blind
+                // SelectColor dispatches through the registered picker. Never click blind
                 // coordinates: when the configured picker is not calibrated, stop the draw and
                 // tell the user where to configure it.
                 if (!ColorPicker.CanSelectCurrently)
@@ -863,6 +863,9 @@ public static class Drawing
             
             // Pre-Process Actions:
             string hex = $"{layer.Color.Red:X2}{layer.Color.Green:X2}{layer.Color.Blue:X2}";
+            var hasExplicitColorAction = actionsCopy.Any(act =>
+                act.Action == InputAction.ActionType.SetColorHex ||
+                (act.Action == InputAction.ActionType.WriteString && act.Data?.Contains("{colorHex}", StringComparison.OrdinalIgnoreCase) == true));
             Console.WriteLine(hex);
             
             foreach (var act in actionsCopy)
@@ -882,6 +885,21 @@ public static class Drawing
                 }
             }
             
+            // A new LxPainter profile has an empty action stack. It still expects one colour
+            // selection per layer, so use the configured picker unless the user's macro already
+            // contains an explicit colour action.
+            if (!hasExplicitColorAction && layer.PixelCount > 0)
+            {
+                if (!ColorPicker.CanSelectCurrently)
+                {
+                    Drawing.Halt();
+                    Dispatcher.UIThread.Post(() => new MessageBox().ShowMessageBox(
+                        "Color picker not set up", LocalizationManager.T("status_error_no_picker_setup"), "warn"));
+                    break;
+                }
+                await ColorPicker.SelectColor($"#{hex}");
+            }
+
             // Use the Actions :D
             foreach (var act in actionsCopy)
             {

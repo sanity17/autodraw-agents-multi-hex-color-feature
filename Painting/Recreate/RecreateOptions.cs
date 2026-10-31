@@ -43,6 +43,11 @@ public sealed class RecreateOptions
     /// <summary>Time between picker clicks/typing.  Kept non-zero because many paint programs
     /// debounce keyboard focus and repaint asynchronously.</summary>
     public int PickerStepDelayMs { get; set; } = 40;
+    public bool MacrosEnabled { get; set; }
+    public ScreenPoint? OpenPickerPoint { get; set; }
+    public ScreenPoint? ClosePickerPoint { get; set; }
+    public int OpenPickerDelayMs { get; set; } = 10;
+    public int ClosePickerDelayMs { get; set; } = 10;
 
     /// <summary>Time allowed for the target application's current-colour indicator to repaint
     /// before it is sampled.</summary>
@@ -98,6 +103,12 @@ public sealed class RecreateOptions
             DryRun = config.RecreateDryRun,
             Canvas = config.DrawRegion,
             CurrentColorPoint = config.RecreateCurrentColorPoint,
+            PickerStepDelayMs = SecondsToMilliseconds(config.DelayInput),
+            MacrosEnabled = config.EnableMacros,
+            OpenPickerPoint = config.OpenPickerCoordinate,
+            ClosePickerPoint = config.ClosePickerCoordinate,
+            OpenPickerDelayMs = SecondsToMilliseconds(config.DelayOpen),
+            ClosePickerDelayMs = SecondsToMilliseconds(config.DelayClose),
             SelectionAttempts = Math.Clamp(config.RecreateSelectionAttempts, 1, 10),
             StrokeAttempts = Math.Clamp(config.RecreateStrokeAttempts, 1, 10),
             FocusGuard = config.RecreateFocusGuard,
@@ -105,6 +116,9 @@ public sealed class RecreateOptions
             CheckpointEveryStrokes = Math.Clamp(config.RecreateCheckpointEvery, 1, 500)
         };
     }
+
+    private static int SecondsToMilliseconds(double seconds)
+        => double.IsFinite(seconds) ? Math.Clamp((int)Math.Round(seconds * 1000d), 0, 60_000) : 0;
 
     /// <summary>Canonicalises the palette colour space to one of CIELAB, RGB, OKLAB.</summary>
     public static string NormalizeColorSpace(string? value)
@@ -145,13 +159,30 @@ public sealed class RecreateOptions
                 PickerPoints.BoxHueEnd => config.BoxHueEnd,
                 PickerPoints.BoxTopLeft => config.BoxTopLeft,
                 PickerPoints.BoxBottomRight => config.BoxBottomRight,
+                PickerPoints.HexField => config.HexCoordinate,
+                PickerPoints.RgbRed => PointAt(config.RgbCoordinates, 0),
+                PickerPoints.RgbGreen => PointAt(config.RgbCoordinates, 1),
+                PickerPoints.RgbBlue => PointAt(config.RgbCoordinates, 2),
+                PickerPoints.HsvHue => PointAt(config.HsvCoordinates, 0),
+                PickerPoints.HsvSaturation => PointAt(config.HsvCoordinates, 1),
+                PickerPoints.HsvValue => PointAt(config.HsvCoordinates, 2),
                 _ => null
             };
 
             if (point is { } value) calibration.Set(requirement.Key, value);
         }
 
+        calibration.SetPaletteSlots(config.PaletteSlots);
         return calibration;
+    }
+
+    private static ScreenPoint? PointAt(IReadOnlyList<ScreenPoint> points, int index)
+        => index >= 0 && index < points.Count ? points[index] : null;
+
+    private static void SetPoint(List<ScreenPoint> points, int index, ScreenPoint value)
+    {
+        while (points.Count <= index) points.Add(default);
+        points[index] = value;
     }
 
     /// <summary>Writes a calibration back into a configuration snapshot.</summary>
@@ -172,9 +203,21 @@ public sealed class RecreateOptions
                 case PickerPoints.BoxHueEnd: config.BoxHueEnd = pair.Value; break;
                 case PickerPoints.BoxTopLeft: config.BoxTopLeft = pair.Value; break;
                 case PickerPoints.BoxBottomRight: config.BoxBottomRight = pair.Value; break;
+                case PickerPoints.HexField: config.HexCoordinate = pair.Value; break;
+                case PickerPoints.RgbRed: SetPoint(config.RgbCoordinates, 0, pair.Value); break;
+                case PickerPoints.RgbGreen: SetPoint(config.RgbCoordinates, 1, pair.Value); break;
+                case PickerPoints.RgbBlue: SetPoint(config.RgbCoordinates, 2, pair.Value); break;
+                case PickerPoints.HsvHue: SetPoint(config.HsvCoordinates, 0, pair.Value); break;
+                case PickerPoints.HsvSaturation: SetPoint(config.HsvCoordinates, 1, pair.Value); break;
+                case PickerPoints.HsvValue: SetPoint(config.HsvCoordinates, 2, pair.Value); break;
             }
         }
 
+        if (calibration.PaletteSlots.Count > 0 || calibration.PickerType.Equals("Palette Match", StringComparison.OrdinalIgnoreCase))
+        {
+            config.PaletteSlots = calibration.PaletteSlots.ToList();
+            config.CapturedPalette = config.PaletteSlots.Select(slot => slot.Hex).ToList();
+        }
         config.PickerType = calibration.PickerType;
         config.ColorPickingMethod = calibration.PickerType.Equals("Box", StringComparison.OrdinalIgnoreCase) ? "Box" : "Circle";
     }
