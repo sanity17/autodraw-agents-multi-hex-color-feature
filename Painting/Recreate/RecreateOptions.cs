@@ -22,7 +22,27 @@ public sealed class RecreateOptions
     public bool WheelClockwise { get; set; }
 
     /// <summary>Colour space used for quantization and layer assignment: CIELAB, RGB or OKLAB.</summary>
-    public string PaletteColorSpace { get; set; } = "CIELAB";
+    public string PaletteColorSpace { get; set; } = "RGB";
+
+    /// <summary>LxPainter drawing method: "1:1 Exact (AutoDraw)" or "Pixel Size Scaling".</summary>
+    public string DrawMethod { get; set; } = "1:1 Exact (AutoDraw)";
+
+    /// <summary>Screen-pixel size of one processed pixel when <see cref="DrawMethod"/> is scaling.</summary>
+    public int PixelSize { get; set; } = 1;
+
+    /// <summary>LxPainter stroke algorithm: "DFS (Default)" or "Concentric".</summary>
+    public string Algorithm { get; set; } = "DFS (Default)";
+
+    /// <summary>4- or 8-directional neighbour search for DFS/concentric bridging.</summary>
+    public string DfsMode { get; set; } = "8-Directional";
+
+    /// <summary>Quantizer selected for this run; also selects Palette Match's distance space.</summary>
+    public string QuantizeMethod { get; set; } = "KMeans++ (Classic)";
+
+    public bool IsPixelSizeScaling =>
+        DrawMethod.Trim().Equals("Pixel Size Scaling", StringComparison.OrdinalIgnoreCase);
+
+    public string PaletteMatchColorSpace => ResolvePaletteMatchColorSpace(QuantizeMethod);
 
     public string LayerOrder { get; set; } = "coverage-desc";
     public StrokeOrder StrokeOrder { get; set; } = StrokeOrder.Serpentine;
@@ -89,7 +109,12 @@ public sealed class RecreateOptions
         {
             PickerType = PickerRegistry.Require(config.PickerType).Id,
             WheelClockwise = string.Equals(config.WheelDirection, "CW", StringComparison.OrdinalIgnoreCase),
-            PaletteColorSpace = NormalizeColorSpace(config.ColorDistanceMethod),
+            PaletteColorSpace = ResolveAssignmentColorSpace(config),
+            DrawMethod = NormalizeDrawMethod(config.DrawMethod),
+            PixelSize = Math.Clamp(config.PixelSize, 1, 64),
+            Algorithm = NormalizeAlgorithm(config.Algorithm),
+            DfsMode = (config.DfsMode ?? string.Empty).Contains('4') ? "4-Directional" : "8-Directional",
+            QuantizeMethod = config.QuantizeMethod ?? string.Empty,
             LayerOrder = LayerOrdering.Normalize(config.RecreateLayerOrder),
             StrokeOrder = ParseStrokeOrder(config.RecreateStrokeOrder),
             PaletteSize = Math.Clamp(config.KClusters, 1, 64),
@@ -129,6 +154,47 @@ public sealed class RecreateOptions
             _ => "CIELAB"
         };
 
+    /// <summary>
+    /// Layer assignment uses an explicit <c>color_distance_method</c> when present; otherwise it
+    /// follows the quantizer's own space, and KMeans++/Wu/NeuQuant/median/div assign in RGB.
+    /// </summary>
+    public static string ResolveAssignmentColorSpace(AutoDrawConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        if (!string.IsNullOrWhiteSpace(config.ColorDistanceMethod))
+            return NormalizeColorSpace(config.ColorDistanceMethod);
+
+        var method = (config.QuantizeMethod ?? string.Empty).ToUpperInvariant();
+        if (method.Contains("OKLAB")) return "OKLAB";
+        if (method.Contains("LAB COLOR") || method.Contains("CIELAB")) return "CIELAB";
+        return "RGB";
+    }
+
+    /// <summary>Palette Match mirrors LxPainter: CIELAB/OKLAB only when that quantizer is active,
+    /// otherwise plain RGB Euclidean distance.</summary>
+    public static string ResolvePaletteMatchColorSpace(string? quantizeMethod)
+    {
+        var method = (quantizeMethod ?? string.Empty).ToUpperInvariant();
+        if (method.Contains("OKLAB")) return "OKLAB";
+        if (method.Contains("LAB COLOR") || method.Contains("CIELAB")) return "CIELAB";
+        return "RGB";
+    }
+
+    public static string NormalizeDrawMethod(string? value)
+        => (value ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "pixel size scaling" or "pixel-size scaling" or "pixel scaling" or "scaled" or "scale"
+                => "Pixel Size Scaling",
+            _ => "1:1 Exact (AutoDraw)"
+        };
+
+    public static string NormalizeAlgorithm(string? value)
+        => (value ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "concentric" => "Concentric",
+            _ => "DFS (Default)"
+        };
+
     public static StrokeOrder ParseStrokeOrder(string? value)
         => (value ?? string.Empty).Trim().ToLowerInvariant() switch
         {
@@ -136,6 +202,34 @@ public sealed class RecreateOptions
                 => StrokeOrder.NearestNeighbor,
             _ => StrokeOrder.Serpentine
         };
+
+    /// <summary>
+    /// Resolves the screen rectangle a run draws into.  LxPainter only requires a selected area in
+    /// "Use Select Area" mode; "Use Drag Image" sizes the canvas from the custom dimensions (or the
+    /// image) and anchors it at the last known draw-region origin.  Throws when area mode has no
+    /// selection so the caller can show the F1 prompt instead of drawing at a default location.
+    /// </summary>
+    public static ScreenRect ResolveCanvas(AutoDrawConfig config, int imageWidth, int imageHeight)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        if (imageWidth <= 0) imageWidth = 1;
+        if (imageHeight <= 0) imageHeight = 1;
+
+        if (config.LocationMode == 0)
+        {
+            if (!config.AreaSelected)
+                throw new InvalidOperationException("Please select an area first (F1).");
+            if (config.DrawRegion.Width <= 0 || config.DrawRegion.Height <= 0)
+                throw new InvalidOperationException("The selected area has no pixels.");
+            return config.DrawRegion;
+        }
+
+        var width = config.CustomWidth > 0 ? config.CustomWidth : imageWidth;
+        var height = config.CustomHeight > 0 ? config.CustomHeight : imageHeight;
+        var left = config.AreaSelected ? config.DrawRegion.Left : 0;
+        var top = config.AreaSelected ? config.DrawRegion.Top : 0;
+        return new ScreenRect(left, top, left + width - 1, top + height - 1);
+    }
 
     /// <summary>
     /// Rebuilds the calibration from the active configuration.  Used by the run path and by the
@@ -222,13 +316,20 @@ public sealed class RecreateOptions
         config.ColorPickingMethod = calibration.PickerType.Equals("Box", StringComparison.OrdinalIgnoreCase) ? "Box" : "Circle";
     }
 
-    internal StrokePlanOptions ToStrokePlanOptions()
+    /// <summary>Projects this immutable run snapshot onto the stroke planner's options.</summary>
+    public StrokePlanOptions ToStrokePlanOptions()
         => new()
         {
             AlphaThreshold = AlphaThreshold,
             BrushSize = BrushSize,
             Order = StrokeOrder,
-            Start = new ScreenPoint(Canvas.Left, Canvas.Top)
+            Start = new ScreenPoint(Canvas.Left, Canvas.Top),
+            Algorithm = Algorithm.Equals("Concentric", StringComparison.OrdinalIgnoreCase)
+                ? StrokeAlgorithm.Concentric
+                : StrokeAlgorithm.Dfs,
+            PixelSize = PixelSize,
+            DrawMethod = DrawMethod,
+            FourDirectional = DfsMode.Contains('4')
         };
 
     /// <summary>Human readable colour for logs and status messages.</summary>

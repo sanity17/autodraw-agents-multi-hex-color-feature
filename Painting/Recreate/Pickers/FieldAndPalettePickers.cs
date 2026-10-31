@@ -39,6 +39,10 @@ public abstract class TextFieldColorPicker : IColorPicker
             await Delay(cancellationToken).ConfigureAwait(false);
             await _input.ReplaceTextAsync(values[i], cancellationToken).ConfigureAwait(false);
             await Delay(cancellationToken).ConfigureAwait(false);
+            // LxPainter's _type_value commits every field with Enter; some pickers only apply the
+            // colour (and repaint the current-colour swatch) after the commit.
+            await _input.PressEnterAsync(cancellationToken).ConfigureAwait(false);
+            await Delay(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -161,7 +165,10 @@ public sealed class HsvPickerDefinition : FieldPickerDefinition
         => new HsvColorPicker(input, options, RequiredPoints(calibration, Points.Select(point => point.Key)));
 }
 
-/// <summary>Clicks the captured swatch nearest to the requested colour using CIE ΔE2000.</summary>
+/// <summary>
+/// Clicks the captured swatch nearest to the requested colour.  LxPainter matches in RGB by
+/// default and switches to CIELAB/OKLab only when the selected quantizer uses that space.
+/// </summary>
 public sealed class PaletteMatchColorPicker : IColorPicker
 {
     private readonly IInputSimulator _input;
@@ -179,11 +186,17 @@ public sealed class PaletteMatchColorPicker : IColorPicker
     {
         PaletteSlot? best = null;
         var bestDistance = double.MaxValue;
+        var space = _options.PaletteMatchColorSpace;
         foreach (var slot in _slots)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!SKColor.TryParse(slot.Hex, out var candidate)) continue;
-            var distance = ColorMatcher.DeltaE2000(color, candidate);
+            var distance = space switch
+            {
+                "OKLAB" => ColorMatcher.OkLabDistance(color, candidate),
+                "CIELAB" => ColorMatcher.DeltaE2000(color, candidate),
+                _ => ColorMatcher.RgbDistance(color, candidate)
+            };
             if (distance >= bestDistance) continue;
             best = slot;
             bestDistance = distance;

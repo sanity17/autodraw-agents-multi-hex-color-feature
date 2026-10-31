@@ -43,7 +43,15 @@ public sealed class CanvasMapper
     }
 
     /// <summary>Maps the centre of pixel <paramref name="x"/>,<paramref name="y"/>.</summary>
-    public ScreenPoint MapPixel(int x, int y) => Map(x + .5, y + .5);
+    /// <remarks>
+    /// Uses floor of the pixel centre instead of round: at a 1:1 scale round() maps both row 1 and
+    /// row 2 to screen row 2 (banker's rounding on .5), and the planner then discards the duplicate
+    /// run, leaving whole rows unpainted.  Floor preserves one distinct row per source row at scale
+    /// 1 and still collapses rows correctly when the image is downscaled.
+    /// </remarks>
+    public ScreenPoint MapPixel(int x, int y) => new(
+        Math.Clamp((int)Math.Floor(OffsetX + (x + .5) * Scale), Canvas.Left, Canvas.Right),
+        Math.Clamp((int)Math.Floor(OffsetY + (y + .5) * Scale), Canvas.Top, Canvas.Bottom));
 
     /// <summary>Maps an inclusive run on one image row to a screen-space horizontal segment.</summary>
     public (ScreenPoint Start, ScreenPoint End) MapRun(int row, int startX, int endX)

@@ -41,9 +41,9 @@ public static class DdConfigService
         catch (Exception ex) { Utils.Log("Auto-saving dd.json failed: " + ex.Message); }
     }
 
-    // Quantize methods the palette pipeline can actually honour.  Legacy "NeuQuant Neural-Net"
-    // is normalized to the default KMeans++ path (matching historical silent behaviour); "median"
-    // routes through MedianCut.
+    // Quantize methods the palette pipeline can actually honour.  LxPainter's own names are kept
+    // so a preset imported from it does not lose the user's choice; the facade routes each one to
+    // its real algorithm (Wu/NeuQuant/median/div/Lcquant/KMeans) in ImageProcessing.
     private static readonly string[] SupportedQuantizers =
     {
         "NeuQuant Neural-Net",
@@ -52,6 +52,11 @@ public static class DdConfigService
         "KMeans++ (Classic)",
         "MiniBatchKMeans (Fast)",
         "Lab Color Space",
+        "CIELAB Method",
+        "OKLAB Method",
+        "RGB Method",
+        "Wu's Quantizer",
+        "Lcquant",
         "Median Cut",
         "median",
         "Div",
@@ -64,8 +69,11 @@ public static class DdConfigService
         "Bright to Dark",
         "Largest area first",
         "Largest Area First",
+        "Largest to smallest",
+        "Smallest to largest",
         "Darkness to brightness",
         "Dark to Bright",
+        "Random",
     };
 
     private static readonly string[] SupportedQuantizeStyles =
@@ -129,6 +137,8 @@ public static class DdConfigService
         c.LayerOrder = string.IsNullOrWhiteSpace(c.LayerOrder) ? "Brightness to darkness" : c.LayerOrder;
         c.RecreateLayerOrder = string.IsNullOrWhiteSpace(c.RecreateLayerOrder) ? "coverage-desc" : c.RecreateLayerOrder.Trim().ToLowerInvariant();
         c.RecreateStrokeOrder = string.IsNullOrWhiteSpace(c.RecreateStrokeOrder) ? "serpentine" : c.RecreateStrokeOrder.Trim().ToLowerInvariant();
+        c.DrawMethod = NormalizeDrawMethod(c.DrawMethod);
+        c.Algorithm = NormalizeAlgorithm(c.Algorithm);
         c.ColorPickingMethod = string.IsNullOrWhiteSpace(c.ColorPickingMethod) ? "Circle" : c.ColorPickingMethod;
         c.PickerType = string.IsNullOrWhiteSpace(c.PickerType) ? "Wheel" : c.PickerType;
         c.RemoveStray = c.RemoveStray || c.StrayRemovalMode.Contains("smart", StringComparison.OrdinalIgnoreCase);
@@ -168,6 +178,9 @@ public static class DdConfigService
             "largest" or "largest-area-first" or "largest area first" or "coverage" or "coverage-desc"
                 => "coverage-desc",
             "smallest" or "smallest-area-first" or "coverage-asc" => "coverage-asc",
+            "smallest to largest" => "coverage-asc",
+            "largest to smallest" => "coverage-desc",
+            "random" => "manual",
             "bright" or "brightness" or "brightness-to-darkness" or "luminance-desc" => "luminance-desc",
             "dark" or "darkness" or "darkness-to-brightness" or "luminance-asc" => "luminance-asc",
             _ => c.RecreateLayerOrder
@@ -197,6 +210,23 @@ public static class DdConfigService
     }
     public static void Export(string path) => File.WriteAllText(path, JsonConvert.SerializeObject(_current, Settings));
 
+    /// <summary>LxPainter drawing method. "Line" was this app's old label for the exact path.</summary>
+    public static string NormalizeDrawMethod(string? value)
+    {
+        var text = (value ?? string.Empty).Trim();
+        if (text.Contains("pixel", StringComparison.OrdinalIgnoreCase) ||
+            text.Equals("scaled", StringComparison.OrdinalIgnoreCase) ||
+            text.Equals("scale", StringComparison.OrdinalIgnoreCase))
+            return "Pixel Size Scaling";
+        return "1:1 Exact (AutoDraw)";
+    }
+
+    /// <summary>LxPainter only offers DFS and Concentric; the removed "Edge Traversal" maps to DFS.</summary>
+    public static string NormalizeAlgorithm(string? value)
+        => (value ?? string.Empty).Trim().Equals("Concentric", StringComparison.OrdinalIgnoreCase)
+            ? "Concentric"
+            : "DFS (Default)";
+
     private static string NormalizeHexColor(string? value)
     {
         var match = System.Text.RegularExpressions.Regex.Match(value ?? string.Empty, "^#?([0-9A-Fa-f]{6})$");
@@ -206,7 +236,7 @@ public static class DdConfigService
     public static bool Validate(AutoDrawConfig c, out string error)
     {
         error = string.Empty;
-        if (c.MonitorIndex < 0 || c.PixelSize < 1 || c.KClusters is < 1 or > 256 || c.Interval < 0 || c.ClickDelay < 0 || c.SeedsCount < 1 || c.BilateralDiameter < 1 || c.LabSpatialIterations < 1 || c.SearchLimit < 1) return Fail("One or more numeric values are outside their valid range.", out error);
+        if (c.MonitorIndex < 0 || c.PixelSize < 1 || c.PixelSize > 64 || c.KClusters is < 1 or > 256 || c.Interval < 0 || c.ClickDelay < 0 || c.SeedsCount < 1 || c.BilateralDiameter < 1 || c.LabSpatialIterations < 1 || c.SearchLimit < 1) return Fail("One or more numeric values are outside their valid range.", out error);
         if (c.BrushSize is < 1 or > 64) return Fail("Brush size must be between 1 and 64 pixels.", out error);
         if (c.RecreateStrokeDelayMs is < 0 or > 60_000) return Fail("Recreate stroke delay must be between 0 and 60000 milliseconds.", out error);
         if (c.RecreateMoveStepPixels is < 1 or > 512) return Fail("Recreate move step must be between 1 and 512 pixels.", out error);
@@ -233,7 +263,8 @@ public static class DdConfigService
         if (c.StencilOpacity is < 0 or > 100 || c.DelayOpen < 0 || c.DelayInput < 0 || c.DelayClose < 0) return Fail("Opacity must be 0–100 and delays cannot be negative.", out error);
         if (c.LockShape && (c.CustomWidth < 1 || c.CustomHeight < 1)) return Fail("Locked shapes require positive custom dimensions.", out error);
         if (c.DrawRegion.Width < 1 || c.DrawRegion.Height < 1) return Fail("Draw region must have positive width and height.", out error);
-        if (!new[] { "DFS (Default)", "Edge Traversal", "Concentric" }.Contains(c.Algorithm)) return Fail("Unsupported drawing algorithm.", out error);
+        if (!new[] { "DFS (Default)", "Concentric" }.Contains(c.Algorithm)) return Fail("Unsupported drawing algorithm.", out error);
+        if (!new[] { "1:1 Exact (AutoDraw)", "Pixel Size Scaling" }.Contains(c.DrawMethod)) return Fail("Unsupported drawing method.", out error);
         if (!new[] { "HEX", "RGB", "HSV", "Wheel", "Box", "Palette Match" }.Contains(c.PickerType, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported picker type.", out error);
         if (!new[] { "Circle", "Box", "Wheel" }.Contains(c.ColorPickingMethod, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported color picker style.", out error);
         if (!new[] { "color", "bw" }.Contains(c.Mode, StringComparer.OrdinalIgnoreCase)) return Fail("Unsupported drawing mode.", out error);

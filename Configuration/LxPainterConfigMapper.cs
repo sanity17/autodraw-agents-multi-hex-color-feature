@@ -47,6 +47,20 @@ public static class LxPainterConfigMapper
             root["quantize_method"] = "KMeans++ (Classic)";
         }
 
+        // `layer_order` is LxPainter's only layer-order field.  Map its labels into the recreate
+        // pipeline's canonical order unless the file already carries an explicit override.
+        if (root["recreate_layer_order"] is null && root["layer_order"]?.Type == JTokenType.String)
+        {
+            root["recreate_layer_order"] = root["layer_order"]!.Value<string>()?.Trim().ToLowerInvariant() switch
+            {
+                "smallest to largest" => "coverage-asc",
+                "brightness to darkness" => "luminance-desc",
+                "darkness to brightness" => "luminance-asc",
+                "random" => "manual",
+                _ => "coverage-desc"
+            };
+        }
+
         return root;
     }
 }

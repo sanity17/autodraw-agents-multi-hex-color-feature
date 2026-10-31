@@ -18,7 +18,8 @@ public static class Quantizer
         int paletteSize,
         int alphaThreshold,
         AutoDrawConfig? config = null,
-        string? colorSpace = null)
+        string? colorSpace = null,
+        bool preprocess = true)
     {
         ArgumentNullException.ThrowIfNull(source);
         if (source.Width <= 0 || source.Height <= 0) return new List<SKColor>();
@@ -30,7 +31,8 @@ public static class Quantizer
             source,
             Math.Clamp(paletteSize, 1, 64),
             (byte)Math.Clamp(alphaThreshold, 0, 255),
-            runConfig)
+            runConfig,
+            preprocess)
             .Distinct()
             .ToList();
     }

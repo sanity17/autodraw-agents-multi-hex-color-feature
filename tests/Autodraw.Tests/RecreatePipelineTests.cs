@@ -46,6 +46,16 @@ public class CanvasMapperTests
         Assert.True(start.X <= end.X);
         Assert.True(start.Y == end.Y);
     }
+
+    [Fact]
+    public void MapPixel_KeepsAdjacentRowsDistinctAtUnitScale()
+    {
+        var mapper = new CanvasMapper(6, 6, new ScreenRect(0, 0, 5, 5));
+
+        var rows = Enumerable.Range(0, 6).Select(y => mapper.MapPixel(0, y).Y).ToArray();
+
+        Assert.Equal(new[] { 0, 1, 2, 3, 4, 5 }, rows);
+    }
 }
 
 public class StrokePlannerTests
@@ -193,8 +203,11 @@ public class LayerOrderingTests
     public void Normalize_AcceptsCommonAliases()
     {
         Assert.Equal("coverage-desc", LayerOrdering.Normalize("Largest area first"));
+        Assert.Equal("coverage-desc", LayerOrdering.Normalize("Largest to smallest"));
+        Assert.Equal("coverage-asc", LayerOrdering.Normalize("Smallest to largest"));
         Assert.Equal("luminance-asc", LayerOrdering.Normalize("darkness-to-brightness"));
         Assert.Equal("manual", LayerOrdering.Normalize("as-is"));
+        Assert.Equal("manual", LayerOrdering.Normalize("Random"));
         Assert.Equal("coverage-desc", LayerOrdering.Normalize("nonsense"));
     }
 }

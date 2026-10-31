@@ -24,10 +24,20 @@ namespace Autodraw;
 public partial class HexedDrawWindow : Window
 {
     private static readonly string[] QuantizeStyles = { "Pixelated (Classic)", "Vectorized (Smooth)" };
-    private static readonly string[] QuantizeMethods = { "MiniBatchKMeans (Fast)", "KMeans++ (Classic)", "KMeans++ (Original)", "KMeans (Random)", "Median Cut", "Div", "NeuQuant Neural-Net", "Lab Color Space" };
+    private static readonly string[] QuantizeMethods =
+    {
+        "MiniBatchKMeans (Fast)", "KMeans++ (Classic)", "KMeans++ (Original)", "KMeans (Random)",
+        "Median Cut", "Div", "NeuQuant Neural-Net", "Lab Color Space",
+        "Lcquant", "Wu's Quantizer", "CIELAB Method", "OKLAB Method", "RGB Method"
+    };
     private static readonly string[] ColorSpaceValues = { "RGB", "OKLAB", "CIELAB" };
-    private static readonly string[] Algorithms = { "DFS (Default)", "Edge Traversal", "Concentric" };
-    private static readonly string[] LayerOrders = { "Brightness to darkness", "Largest area first", "Darkness to brightness" };
+    private static readonly string[] Algorithms = { "DFS (Default)", "Concentric" };
+    private static readonly string[] DrawMethods = { "1:1 Exact (AutoDraw)", "Pixel Size Scaling" };
+    private static readonly string[] LayerOrders =
+    {
+        "Brightness to darkness", "Largest area first", "Darkness to brightness",
+        "Smallest to largest", "Random"
+    };
     private static readonly string[] StrayModes = { "Disabled", "Smart Merge (V5)" };
     private static readonly string[] DrawerModules = { "Old (No Bridge)", "New (A* Bridge)" };
     private static readonly string[] PickerTypes = { "HEX", "RGB", "HSV", "Wheel", "Box", "Palette Match" };
@@ -274,8 +284,9 @@ public partial class HexedDrawWindow : Window
     {
         if (_updating || DrawMethodCombo.SelectedIndex < 0) return;
         var config = DdConfigService.Current;
-        config.DrawMethod = DrawMethodCombo.SelectedIndex == 0 ? "Line" : "1:1 Exact (AutoDraw)";
+        config.DrawMethod = DrawMethods[Math.Clamp(DrawMethodCombo.SelectedIndex, 0, DrawMethods.Length - 1)];
         ApplyConfig(config);
+        ScheduleAutoQuantize();
     }
 
     private void GeneralToggle_OnChanged(object? sender, RoutedEventArgs e)
@@ -429,7 +440,11 @@ public partial class HexedDrawWindow : Window
         var index = Math.Clamp(ColorSpaceCombo.SelectedIndex, 0, ColorSpaceValues.Length - 1);
         var config = DdConfigService.Current;
         config.ColorDistanceMethod = ColorSpaceValues[index];
-        config.QuantizeMethod = index == 2 ? "Lab Color Space" : config.QuantizeMethod;
+        // LxPainter selects the KMeans space by quantizer name; keep the two controls in sync.
+        if (index == 2) config.QuantizeMethod = "CIELAB Method";
+        else if (index == 1) config.QuantizeMethod = "OKLAB Method";
+        else if (config.QuantizeMethod is "Lab Color Space" or "CIELAB Method" or "OKLAB Method")
+            config.QuantizeMethod = "RGB Method";
         ApplyConfig(config);
         SetStatus(LocalizationManager.F("status_colorspace_changed", ColorSpaceCombo.SelectedItem?.ToString() ?? config.ColorDistanceMethod));
         ScheduleAutoQuantize();
@@ -460,6 +475,8 @@ public partial class HexedDrawWindow : Window
         var index = Math.Clamp(DrawOrderCombo.SelectedIndex, 0, LayerOrders.Length - 1);
         var config = DdConfigService.Current;
         config.LayerOrder = LayerOrders[index];
+        // LxPainter has one layer-order field; the colour-layer pipeline reads the canonical one.
+        config.RecreateLayerOrder = LayerOrdering.Normalize(config.LayerOrder);
         ApplyConfig(config);
         SetStatus(LocalizationManager.F("status_order_changed", DrawOrderCombo.SelectedItem?.ToString() ?? config.LayerOrder));
     }
@@ -1069,6 +1086,20 @@ public partial class HexedDrawWindow : Window
         return value == key ? fallback : value;
     }
 
+    /// <summary>Maps both LxPainter and legacy layer-order labels to the General-tab indices.</summary>
+    private static int LayerOrderIndex(string? value)
+    {
+        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
+        return text switch
+        {
+            "largest to smallest" or "largest area first" => 1,
+            "darkness to brightness" or "dark to bright" => 2,
+            "smallest to largest" => 3,
+            "random" => 4,
+            _ => 0
+        };
+    }
+
     public void RefreshFromConfig()
     {
         var config = DdConfigService.Current;
@@ -1085,7 +1116,8 @@ public partial class HexedDrawWindow : Window
         SearchLimitInput.Text = config.SearchLimit.ToString(CultureInfo.InvariantCulture);
         LockShapeCheck.IsChecked = config.LockShape;
         StencilEnabledCheck.IsChecked = config.StencilEnabled;
-        DrawMethodCombo.SelectedIndex = config.DrawMethod.Equals("Line", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
+        DrawMethodCombo.SelectedIndex = Math.Max(0, Array.IndexOf(DrawMethods,
+            DdConfigService.NormalizeDrawMethod(config.DrawMethod)));
         UseBilateralCheck.IsChecked = config.UseBilateral;
         UseSeedsCheck.IsChecked = config.UseSeeds;
         LumWeightInput.Text = config.LabLumWeight.ToString("0.###", CultureInfo.InvariantCulture);
@@ -1128,9 +1160,9 @@ public partial class HexedDrawWindow : Window
         QuantizeMethodCombo.SelectedIndex = Math.Max(0, quantizeIndex);
         ColorSpaceCombo.SelectedIndex = Math.Max(0, Array.IndexOf(ColorSpaceValues,
             RecreateOptions.NormalizeColorSpace(config.ColorDistanceMethod)));
-        AlgorithmCombo.SelectedIndex = Math.Max(0, Array.IndexOf(Algorithms, config.Algorithm));
-        DrawOrderCombo.SelectedIndex = Math.Max(0, Array.FindIndex(LayerOrders,
-            order => order.Equals(config.LayerOrder, StringComparison.OrdinalIgnoreCase)));
+        AlgorithmCombo.SelectedIndex = Math.Max(0, Array.IndexOf(Algorithms,
+            DdConfigService.NormalizeAlgorithm(config.Algorithm)));
+        DrawOrderCombo.SelectedIndex = LayerOrderIndex(config.LayerOrder);
         StrayRemovalCombo.SelectedIndex = config.RemoveStray ? 1 : 0;
         DrawerModuleCombo.SelectedIndex = config.DrawerModule.Contains("old", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
         PaletteRotationCombo.SelectedIndex = config.WheelDirection.Equals("CW", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
@@ -1201,7 +1233,11 @@ public partial class HexedDrawWindow : Window
         DrawMethodLabel.Text = Label("method", "Method:");
         LockShapeCheck.Content = Label("lock_shape", "Lock Shape Dimensions");
         StencilEnabledCheck.Content = Label("stencil_enabled", "Toggle Stencil (F7)");
-        DrawMethodCombo.ItemsSource = new[] { "Line", "1:1 Exact (AutoDraw)" };
+        DrawMethodCombo.ItemsSource = new[]
+        {
+            Label("draw_exact", DrawMethods[0]),
+            Label("draw_pixel_scale", DrawMethods[1])
+        };
         PreviewHeaderText.Text = LocalizationManager.T("lf_preview");
         PreviewHintText.Text = LocalizationManager.T("label_preview_area");
 
@@ -1335,7 +1371,12 @@ public partial class HexedDrawWindow : Window
             Label("qmethod_median", QuantizeMethods[4]),
             Label("qmethod_div", QuantizeMethods[5]),
             Label("qmethod_neuquant", QuantizeMethods[6]),
-            QuantizeMethods[7]
+            QuantizeMethods[7],
+            Label("qmethod_lcquant", QuantizeMethods[8]),
+            Label("qmethod_wu", QuantizeMethods[9]),
+            Label("qmethod_cielab", QuantizeMethods[10]),
+            Label("qmethod_oklab", QuantizeMethods[11]),
+            Label("qmethod_rgb", QuantizeMethods[12])
         };
         ColorSpaceCombo.ItemsSource = new[] { "sRGB", "OKLAB", "CIELAB" };
         AlgorithmCombo.ItemsSource = Algorithms;
@@ -1343,7 +1384,9 @@ public partial class HexedDrawWindow : Window
         {
             LocalizationManager.T("order_bright"),
             LocalizationManager.T("order_large"),
-            LocalizationManager.T("order_dark")
+            LocalizationManager.T("order_dark"),
+            Label("order_smallest", "Smallest to largest"),
+            Label("order_random", "Random")
         };
         StrayRemovalCombo.ItemsSource = new[]
         {

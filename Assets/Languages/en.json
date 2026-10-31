@@ -367,5 +367,14 @@
     "qmethod_div":  "Div",
     "qmethod_median":  "Median Cut",
     "qmethod_neuquant":  "NeuQuant Neural-Net",
+    "qmethod_lcquant":  "Lcquant",
+    "qmethod_wu":  "Wu's Quantizer",
+    "qmethod_cielab":  "CIELAB Method",
+    "qmethod_oklab":  "OKLAB Method",
+    "qmethod_rgb":  "RGB Method",
+    "draw_exact":  "1:1 Exact (AutoDraw)",
+    "draw_pixel_scale":  "Pixel Size Scaling",
+    "order_smallest":  "Smallest to largest",
+    "order_random":  "Random",
     "safe_search_strict":  "Strict"
 }

@@ -367,5 +367,14 @@
     "qmethod_div":  "Div",
     "qmethod_median":  "Median Cut",
     "qmethod_neuquant":  "NeuQuant Neural-Net",
+    "qmethod_lcquant":  "Lcquant",
+    "qmethod_wu":  "Квантователь Ву",
+    "qmethod_cielab":  "Метод CIELAB",
+    "qmethod_oklab":  "Метод OKLAB",
+    "qmethod_rgb":  "Метод RGB",
+    "draw_exact":  "1:1 точно (AutoDraw)",
+    "draw_pixel_scale":  "Масштабирование по размеру пикселя",
+    "order_smallest":  "От меньшего к большему",
+    "order_random":  "Случайно",
     "safe_search_strict":  "Strict"
 }

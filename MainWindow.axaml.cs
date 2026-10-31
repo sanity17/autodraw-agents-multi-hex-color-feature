@@ -2202,13 +2202,21 @@ public partial class MainWindow : Window
             HexedStatus("status_error_no_area_image");
             return;
         }
-        if (!DdConfigService.Current.AreaSelected)
+
+        var config = DdConfigService.Current;
+        if (config.MaskMode != LayerMaskMode.ColorLayers && !config.AreaSelected)
+        {
+            HexedStatus("status_select_area_f1");
+            return;
+        }
+        // The colour-layer pipeline can run from custom/image dimensions in LxPainter's drag mode;
+        // only "Use Select Area" requires an F1 selection.
+        if (config.MaskMode == LayerMaskMode.ColorLayers && config.LocationMode == 0 && !config.AreaSelected)
         {
             HexedStatus("status_select_area_f1");
             return;
         }
 
-        var config = DdConfigService.Current;
         if (config.MaskMode == LayerMaskMode.ColorLayers)
         {
             await StartColorLayerRecreateAsync(config);
@@ -2286,8 +2294,28 @@ public partial class MainWindow : Window
             return;
         }
 
+        // LxPainter's drag mode gets its origin from the rectangle the user drags at run time.
+        // AutoDraw has no image-drag primitive, so ask for that anchor with the existing F1 overlay
+        // rather than silently drawing from (0, 0).
+        if (config.LocationMode != 0 && !config.AreaSelected)
+        {
+            await SelectDrawAreaAsync();
+            config = DdConfigService.Current;
+            if (!config.AreaSelected) return;
+        }
+
         var options = RecreateOptions.FromConfig(config);
-        options.Canvas = config.DrawRegion;
+        try
+        {
+            options.Canvas = RecreateOptions.ResolveCanvas(config, _preFxBitmap.Width, _preFxBitmap.Height);
+        }
+        catch (InvalidOperationException ex)
+        {
+            HexedStatus(config.LocationMode == 0 && !config.AreaSelected
+                ? "status_select_area_f1"
+                : "status_recreate_error", ex.Message);
+            return;
+        }
         options.DisposeLayers = false;
 
         IInputSimulator input;
@@ -2378,7 +2406,7 @@ public partial class MainWindow : Window
             IFocusGuard? focusGuard = null;
             if (!options.DryRun)
             {
-                Drawing.LastPos = new Vector2(config.DrawRegion.Left, config.DrawRegion.Top);
+                Drawing.LastPos = new Vector2(options.Canvas.Left, options.Canvas.Top);
                 Drawing.ClipToRegion = true;
                 Drawing.ShowPopup = false;
                 Drawing.IsDrawing = true;

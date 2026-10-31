@@ -367,5 +367,14 @@
     "qmethod_div":  "Div",
     "qmethod_median":  "Median Cut",
     "qmethod_neuquant":  "NeuQuant Neural-Net",
+    "qmethod_lcquant":  "Lcquant",
+    "qmethod_wu":  "우 양자화기",
+    "qmethod_cielab":  "CIELAB 방식",
+    "qmethod_oklab":  "OKLAB 방식",
+    "qmethod_rgb":  "RGB 방식",
+    "draw_exact":  "1:1 정확 (AutoDraw)",
+    "draw_pixel_scale":  "픽셀 크기 조정",
+    "order_smallest":  "작은 것부터 큰 것까지",
+    "order_random":  "무작위",
     "safe_search_strict":  "Strict"
 }

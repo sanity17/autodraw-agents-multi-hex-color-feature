@@ -49,11 +49,11 @@ public static class LayerOrdering
         var normalized = (value ?? string.Empty).Trim().ToLowerInvariant();
         return normalized switch
         {
-            "largest" or "largest-area-first" or "largest area first" or "coverage" or "coverage-desc" => "coverage-desc",
-            "smallest" or "smallest-area-first" or "coverage-asc" => "coverage-asc",
+            "largest" or "largest-area-first" or "largest area first" or "largest to smallest" or "coverage" or "coverage-desc" => "coverage-desc",
+            "smallest" or "smallest-area-first" or "smallest to largest" or "coverage-asc" => "coverage-asc",
             "bright" or "brightness" or "brightness-to-darkness" or "luminance-desc" => "luminance-desc",
             "dark" or "darkness" or "darkness-to-brightness" or "luminance-asc" => "luminance-asc",
-            "manual" or "user" or "as-is" or "source" => "manual",
+            "manual" or "user" or "as-is" or "source" or "random" => "manual",
             _ => "coverage-desc"
         };
     }

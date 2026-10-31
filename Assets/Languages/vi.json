@@ -367,5 +367,14 @@
     "qmethod_div":  "Div",
     "qmethod_median":  "Median Cut",
     "qmethod_neuquant":  "NeuQuant Neural-Net",
+    "qmethod_lcquant":  "Lcquant",
+    "qmethod_wu":  "Bộ lượng tử Wu",
+    "qmethod_cielab":  "Phương pháp CIELAB",
+    "qmethod_oklab":  "Phương pháp OKLAB",
+    "qmethod_rgb":  "Phương pháp RGB",
+    "draw_exact":  "1:1 chính xác (AutoDraw)",
+    "draw_pixel_scale":  "Tỷ lệ theo kích thước điểm ảnh",
+    "order_smallest":  "Nhỏ đến lớn",
+    "order_random":  "Ngẫu nhiên",
     "safe_search_strict":  "Strict"
 }

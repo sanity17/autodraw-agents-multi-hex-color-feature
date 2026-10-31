@@ -23,6 +23,7 @@ public sealed class MacroColorPicker : IColorPicker
     {
         if (_options.MacrosEnabled && _options.OpenPickerPoint is { } open)
         {
+            await _options.DelayAsync(_options.OpenPickerDelayMs, cancellationToken).ConfigureAwait(false);
             await _input.ClickAsync(open, cancellationToken).ConfigureAwait(false);
             await _options.DelayAsync(_options.OpenPickerDelayMs, cancellationToken).ConfigureAwait(false);
         }
@@ -33,6 +34,7 @@ public sealed class MacroColorPicker : IColorPicker
         {
             await _options.DelayAsync(_options.ClosePickerDelayMs, cancellationToken).ConfigureAwait(false);
             await _input.ClickAsync(close, cancellationToken).ConfigureAwait(false);
+            await _options.DelayAsync(_options.ClosePickerDelayMs, cancellationToken).ConfigureAwait(false);
         }
     }
 }
