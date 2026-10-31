@@ -591,7 +591,7 @@ public partial class MainWindow : Window
         {
             try
             {
-                var color = ScreenColorCapture.Capture(ToScreenPoint(points[0]));
+                var color = CaptureScreenColor(ToScreenPoint(points[0]));
                 var hex = $"#{color.Red:X2}{color.Green:X2}{color.Blue:X2}";
                 saved = SaveRecreatePoint(config =>
                 {
@@ -609,8 +609,8 @@ public partial class MainWindow : Window
                 var point = ToScreenPoint(points[0]);
                 switch (_calibrationMode)
                 {
-                    case ColorPickerCalibrationMode.OpenPicker: config.OpenPickerCoord = point; break;
-                    case ColorPickerCalibrationMode.ClosePicker: config.ClosePickerCoord = point; break;
+                    case ColorPickerCalibrationMode.OpenPicker: config.OpenPickerCoordinate = point; break;
+                    case ColorPickerCalibrationMode.ClosePicker: config.ClosePickerCoordinate = point; break;
                     default: config.RecreateCurrentColorPoint = point; break;
                 }
             }, out error);
@@ -643,7 +643,7 @@ public partial class MainWindow : Window
             var slots = _colorPickerCalibrationPoints.Select(point =>
             {
                 var screenPoint = ToScreenPoint(point);
-                var color = ScreenColorCapture.Capture(screenPoint);
+                var color = CaptureScreenColor(screenPoint);
                 return new PaletteSlot { Coord = screenPoint, Hex = $"#{color.Red:X2}{color.Green:X2}{color.Blue:X2}" };
             }).ToList();
             saved = SaveRecreatePoint(config =>
@@ -655,6 +655,10 @@ public partial class MainWindow : Window
         catch (Exception ex) { error = ex.Message; }
         FinishColorPickerCalibration(saved, error);
     }
+
+    private static SKColor CaptureScreenColor(ScreenPoint point)
+        => new GdiScreenColorSampler().TrySample(point)
+           ?? throw new InvalidOperationException("Could not capture the selected screen pixel.");
 
     private static ScreenPoint ToScreenPoint(Vector2 point)
         => new((int)Math.Round(point.X), (int)Math.Round(point.Y));
